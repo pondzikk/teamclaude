@@ -354,6 +354,12 @@ function formatHeaders(headers) {
 }
 
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
+  // Temporary stage-timing instrumentation (TEAMCLAUDE_DEBUG_TIMING=1): pins
+  // down WHERE a request stalls (selection / token / admit / fetch / headers).
+  const t0 = Date.now();
+  const dbg = process.env.TEAMCLAUDE_DEBUG_TIMING
+    ? (m) => console.log(`[tc-dbg] req#${reqId} r${retryCount} +${Date.now() - t0}ms ${m}`)
+    : null;
   const maxRetries = accountManager.accounts.length;
   // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
   // from the default policy ('always' routes; 'off'/'429' start direct).
@@ -412,9 +418,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Track which account handles this request
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
+  dbg?.(`selected ${account.name} inFlight=${account.inFlight} rampAge=${account.rampStartedAt ? Date.now() - account.rampStartedAt : 'off'}`);
 
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
+  dbg?.('token fresh');
   if (account.status === 'error' && retryCount < maxRetries) {
     ctx.tried.add(account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -479,6 +487,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
     if (!await accountManager.admit(account.index, () => res.destroyed)) return;
+    dbg?.(`admitted inFlight=${account.inFlight}`);
     let upstreamRes;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -490,6 +499,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     } finally {
       accountManager.release(account.index);
     }
+    dbg?.(`headers status=${upstreamRes.status}`);
 
     // Extract rate limit headers
     const rateLimitHeaders = {};

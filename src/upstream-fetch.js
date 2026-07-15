@@ -12,6 +12,33 @@
 import https from 'node:https';
 import { Readable } from 'node:stream';
 import { tunnelTls } from './sx.js';
+import { fetch as undiciFetch, Agent } from 'undici';
+
+// Parallelize upstream connections (fork change; drops the upstream project's
+// zero-dependency constraint). Node's built-in fetch multiplexes every request
+// to one origin over a SINGLE connection (H2), and the upstream's
+// per-connection concurrent-stream budget then serializes the whole fleet:
+// with a dozen long-lived SSE completions in flight, a tiny request queues for
+// minutes inside the dispatcher (measured on the live proxy: 90s+ TTFB while
+// the same account answered a direct curl in <1s; lsof showed exactly ONE
+// ESTABLISHED connection to api.anthropic.com carrying 14 in-flight requests).
+// Claude Code run DIRECT is smooth precisely because every process gets its own
+// connection — so give the proxy what direct has: plain HTTP/1.1, one in-flight
+// request per connection, a wide connection budget. npm undici's
+// setGlobalDispatcher does NOT reach Node's built-in fetch (separate
+// registries), so the dispatcher is passed explicitly to undici's own fetch.
+const UPSTREAM_AGENT = new Agent({
+  // CRITICAL: undici 8 defaults allowH2 to true (lib/core/connect.js:
+  // `allowH2 = allowH2 != null ? allowH2 : true`), which ALPN-negotiates h2 and
+  // multiplexes EVERYTHING over one connection again — `connections` then never
+  // grows the pool. H1-only is the whole point of this agent.
+  allowH2: false,
+  connections: 1024,       // effectively one connection per concurrent stream
+  pipelining: 1,           // never queue a request behind another on a socket
+  keepAliveTimeout: 30_000,
+  keepAliveMaxTimeout: 600_000,
+});
+console.log('[TeamClaude] upstream dispatcher: undici H1-only, connections=1024, pipelining=1');
 
 // Time to wait for RESPONSE HEADERS before treating the upstream socket as dead.
 // This is NOT a limit on the response body (SSE completions can stream for
@@ -71,14 +98,15 @@ export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
   return proxiedFetch(url, fetchOpts, sx, timeoutMs);
 }
 
-// Global fetch driven by our own AbortController so we can arm a headers-only
-// deadline and disarm it the moment headers arrive (letting the body stream with
-// no deadline). AbortSignal.timeout can't do this — it would also kill the body.
+// undici fetch (explicit parallel dispatcher — see UPSTREAM_AGENT) driven by our
+// own AbortController so we can arm a headers-only deadline and disarm it the
+// moment headers arrive (letting the body stream with no deadline).
+// AbortSignal.timeout can't do this — it would also kill the body.
 function directFetch(url, opts, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(headersTimeoutError(timeoutMs)), timeoutMs);
   timer.unref?.();
-  return fetch(url, { ...opts, signal: ctrl.signal }).then(
+  return undiciFetch(url, { ...opts, dispatcher: UPSTREAM_AGENT, signal: ctrl.signal }).then(
     (res) => { clearTimeout(timer); return res; },
     (err) => { clearTimeout(timer); throw err; },
   );
