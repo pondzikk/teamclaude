@@ -41,6 +41,8 @@ export class SessionIdFinder {
     this.matchPos = 0;         // PREFIX match progress (within target)
     this.captureRemaining = 0; // value bytes left to capture
     this.captured = [];
+    this.pending = null;       // captured 36 bytes awaiting their delimiter
+    this.awaitDelim = false;
     this.done = false;
     this.value = null;         // the extracted session id (or null)
   }
@@ -93,21 +95,40 @@ export class SessionIdFinder {
   }
 
   // Inside the metadata.user_id string value: stream-match the session_id key
-  // and capture its 36-byte value. An (unescaped) closing quote exits the value.
+  // and capture its 36-byte value, then require the value's own closing
+  // delimiter (the \" that ends it inside the stringified JSON) so a longer
+  // uuid-charset-prefixed value is rejected rather than silently truncated —
+  // truncation could collide two distinct sessions onto one binding.
   #targetByte(b) {
     if (this.captureRemaining > 0) {
       this.captured.push(b);
       this.captureRemaining--;
       if (this.captureRemaining === 0) {
         const s = Buffer.from(this.captured).toString('latin1');
-        this.value = UUID_RE.test(s) ? s : null;
-        this.done = true; // one user_id per body
+        this.pending = UUID_RE.test(s) ? s : null;
+        if (this.pending == null) { this.done = true; return; } // invalid regardless of delimiter
+        this.awaitDelim = true;
       }
+      return;
+    }
+    if (this.awaitDelim) {
+      this.value = (b === 0x5c || b === 0x22) ? this.pending : null;
+      this.done = true; // one user_id per body
       return;
     }
     if (this.esc) { this.esc = false; this.#match(b); return; }
     if (b === 0x5c) { this.esc = true; this.#match(b); return; }
-    if (b === 0x22) { this.target = false; this.matchPos = 0; return; } // end of user_id value
+    if (b === 0x22) {
+      // Unescaped quote: the user_id value ends — and so does the enclosing
+      // JSON string. inStr must drop with it, or the outer machine would treat
+      // the rest of the body as string content (desync: the metadata frame
+      // never pops and later message content could match as if it were the
+      // target — the source of phantom session ids for plain-string user_ids).
+      this.target = false;
+      this.inStr = false;
+      this.matchPos = 0;
+      return;
+    }
     this.#match(b);
   }
 

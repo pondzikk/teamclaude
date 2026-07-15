@@ -196,15 +196,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const modelFinder = new TopLevelFieldFinder('model');
       // Claude Code's session id (metadata.user_id → session_id) keys the
       // session→account affinity that keeps a session's per-account prompt
-      // cache warm; scanned incrementally alongside the model finder.
-      const sessionFinder = new SessionIdFinder();
+      // cache warm; scanned incrementally alongside the model finder. Only
+      // /v1/messages* carries it — skip the per-byte walk everywhere else.
+      const sessionFinder = (req.url || '').startsWith('/v1/messages') ? new SessionIdFinder() : null;
       for await (const chunk of req) {
         bodyChunks.push(chunk);
         if (!modelFinder.done) {
           const found = modelFinder.push(chunk);
           if (found) hooks.onRequestModel?.(reqId, { model: found });
         }
-        if (!sessionFinder.done) sessionFinder.push(chunk);
+        if (sessionFinder && !sessionFinder.done) sessionFinder.push(chunk);
       }
       const body = Buffer.concat(bodyChunks);
 
@@ -213,7 +214,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
       const advisorModel = parseAdvisorModel(body);
-      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, sessionId: sessionFinder.value };
+      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, sessionId: sessionFinder?.value ?? null };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {

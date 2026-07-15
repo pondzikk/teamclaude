@@ -66,6 +66,26 @@ test('overlapping partial match cannot skip the real key (KMP)', () => {
   assert.strictEqual(extractSessionId(b), SID);
 });
 
+test('plain-string user_id does not desync the parser into message content', () => {
+  // metadata BEFORE messages, user_id without session_id, decoy pattern in a
+  // later message — the desynced machine used to extract the decoy
+  const b = Buffer.from(JSON.stringify({
+    metadata: { user_id: 'plain-opaque-user-id' },
+    messages: [{ role: 'user', content: `{"user_id":"{\\"session_id\\":\\"${SID2}\\"}"}` }],
+  }));
+  assert.strictEqual(extractSessionId(b), null);
+});
+
+test('value longer than 36 chars is rejected, not truncated', () => {
+  const uid = JSON.stringify({ session_id: SID + 'deadbeef' });
+  const b = Buffer.from(JSON.stringify({ metadata: { user_id: uid }, messages: [] }));
+  assert.strictEqual(extractSessionId(b), null);
+});
+
+test('exactly-36-char uuid followed by its closing quote is accepted', () => {
+  assert.strictEqual(extractSessionId(body(SID)), SID);
+});
+
 // --- Affinity routing ---
 
 test('same session sticks to the same account across requests', () => {
@@ -116,11 +136,87 @@ test('rebinds when the bound account becomes unavailable, sticky afterwards', ()
   assert.strictEqual(m.getAccountForSession(SID).index, second.index);
 });
 
-test('excluded (already-tried) bound account is not returned again this request', () => {
+test('excluded (already-tried) bound account is detoured, NOT rebound', () => {
   const m = makeManager(2);
   const first = m.getAccountForSession(SID);
   const retry = m.getAccountForSession(SID, new Set([first.index]));
   assert.notStrictEqual(retry.index, first.index);
+  // exclude is per-request transient: the binding must survive the detour so
+  // the next request returns to the warm-cache account
+  assert.strictEqual(m.sessions.get(SID).index, first.index);
+  assert.strictEqual(m.getAccountForSession(SID).index, first.index);
+});
+
+test('model-scoped family bar is a detour: binding survives, other models stay warm', () => {
+  const m = makeManager(2, { priorities: [0, 1] });
+  const first = m.getAccountForSession(SID, null, 'claude-opus-4-8');
+  assert.strictEqual(first.name, 'acct-0');
+  // spend acct-0's Fable weekly bucket only (shared buckets stay healthy)
+  m.updateQuota(first.index, { 'anthropic-ratelimit-unified-7d_oi-utilization': '0.99' });
+  const fable = m.getAccountForSession(SID, null, 'claude-fable-5');
+  assert.strictEqual(fable.name, 'acct-1'); // detoured for fable
+  assert.strictEqual(m.sessions.get(SID).index, first.index); // binding intact
+  const opus = m.getAccountForSession(SID, null, 'claude-opus-4-8');
+  assert.strictEqual(opus.name, 'acct-0'); // other models still warm on acct-0
+  // repeated fable detours land deterministically on the same account
+  assert.strictEqual(m.getAccountForSession(SID, null, 'claude-fable-5').name, 'acct-1');
+});
+
+test('manual route pin outranks affinity without rewriting the binding', () => {
+  const m = makeManager(2, { priorities: [0, 1] });
+  const first = m.getAccountForSession(SID, null, 'claude-fable-5');
+  assert.strictEqual(first.name, 'acct-0');
+  assert.strictEqual(m.setRoutePin('fable', 1).ok, true);
+  assert.strictEqual(m.getAccountForSession(SID, null, 'claude-fable-5').name, 'acct-1');
+  assert.strictEqual(m.sessions.get(SID).index, first.index); // binding untouched
+  m.clearRoutePin('fable');
+  assert.strictEqual(m.getAccountForSession(SID, null, 'claude-fable-5').name, 'acct-0');
+});
+
+test('rebind after account death arms the storm-control ramp on the target', () => {
+  const m = makeManager(2);
+  const first = m.getAccountForSession(SID);
+  const other = m.accounts[1 - first.index];
+  assert.strictEqual(other.rampStartedAt, null);
+  m.markRateLimited(first.index, 300); // quota-rejection path
+  const second = m.getAccountForSession(SID);
+  assert.strictEqual(second.index, other.index);
+  assert.ok(other.rampStartedAt != null, 'ramp must be armed for the rebind herd');
+});
+
+test('advisor-ineligible fleet degrades softly: session stays bound (no split)', () => {
+  const m = makeManager(2);
+  const first = m.getAccountForSession(SID, null, 'claude-opus-4-8');
+  // no account can serve the advisor model's weekly bucket
+  for (const a of m.accounts) {
+    m.updateQuota(a.index, { 'anthropic-ratelimit-unified-7d_oi-utilization': '0.99' });
+  }
+  const got = m.getAccountForSession(SID, null, 'claude-opus-4-8', 'claude-fable-5');
+  assert.strictEqual(got.index, first.index, 'must stay on the bound account, cache intact');
+  assert.strictEqual(m.sessions.get(SID).index, first.index);
+});
+
+test('new sessions avoid rate-limit-paused accounts within a tier', () => {
+  const m = makeManager(2);
+  m.pauseAccount(0, 60);
+  const a = m.getAccountForSession(SID);
+  assert.strictEqual(a.index, 1);
+  // but a BOUND session on a paused account stays (admit() waits, cache kept)
+  m.pauseAccount(1, 60);
+  assert.strictEqual(m.getAccountForSession(SID).index, 1);
+});
+
+test('sessions map is capped: stalest binding evicted at maxTracked', () => {
+  const m = makeManager(2, { affinity: { maxTracked: 3 } });
+  const ids = Array.from({ length: 4 }, (_, i) => `00000000-0000-4000-8000-00000000000${i}`);
+  for (const [i, id] of ids.entries()) {
+    m.getAccountForSession(id);
+    m.sessions.get(id).lastSeen = Date.now() - (1000 - i); // oldest = ids[0]
+  }
+  assert.strictEqual(m.sessions.size, 3);
+  assert.ok(!m.sessions.has(ids[0]), 'stalest binding evicted');
+  const total = m._sessionCounts.reduce((a, b) => a + b, 0);
+  assert.strictEqual(total, 3, 'incremental counts stay consistent');
 });
 
 test('no session id falls back to legacy selection', () => {

@@ -154,22 +154,62 @@ export class AccountManager {
       enabled: process.env.TEAMCLAUDE_SESSION_AFFINITY === '0' ? false : aff.enabled !== false,
       maxPerAccount: Number(process.env.TEAMCLAUDE_MAX_SESSIONS_PER_ACCOUNT) || aff.maxPerAccount || 8,
       ttlMs: (Number(process.env.TEAMCLAUDE_SESSION_TTL_MINUTES) || aff.ttlMinutes || 60) * 60_000,
+      // Hard size cap: session ids are client-supplied (every one-shot
+      // `claude -p` is a fresh id), so TTL alone can't bound the map.
+      maxTracked: Number(process.env.TEAMCLAUDE_MAX_TRACKED_SESSIONS) || aff.maxTracked || 5000,
     };
     this.sessions = new Map();
+    // Bound-session count per account index, maintained incrementally by
+    // _bindSession/_sweepSessions so placement never scans the whole map.
+    this._sessionCounts = new Array(this.accounts.length).fill(0);
+    this._nextSweepAt = 0;
   }
 
   /** Sessions currently bound to account `index` (the affinity load metric). */
   _sessionCount(index) {
-    let n = 0;
-    for (const s of this.sessions.values()) if (s.index === index) n++;
-    return n;
+    return this._sessionCounts[index] || 0;
   }
 
   /** Drop session bindings idle past the TTL. */
   _sweepSessions(now = Date.now()) {
     for (const [id, s] of this.sessions) {
-      if (now - s.lastSeen > this.affinity.ttlMs) this.sessions.delete(id);
+      if (now - s.lastSeen > this.affinity.ttlMs) {
+        this._sessionCounts[s.index] = Math.max(0, this._sessionCount(s.index) - 1);
+        this.sessions.delete(id);
+      }
     }
+  }
+
+  /** Sweep at most every 30s — the request path calls this per request and a
+   * full-map walk per request is wasted work (expiry precision is irrelevant
+   * next to a 60-minute TTL). */
+  _maybeSweepSessions(now = Date.now()) {
+    if (now < this._nextSweepAt) return;
+    this._nextSweepAt = now + 30_000;
+    this._sweepSessions(now);
+  }
+
+  /** Record (or move) a session binding, keeping the per-account counts and the
+   * size cap: at maxTracked the stalest binding is evicted so client-supplied
+   * session ids can't grow the map without bound. */
+  _bindSession(sessionId, index) {
+    const prev = this.sessions.get(sessionId);
+    if (prev) {
+      this._sessionCounts[prev.index] = Math.max(0, this._sessionCount(prev.index) - 1);
+    } else if (this.sessions.size >= this.affinity.maxTracked) {
+      let oldestId = null;
+      let oldestSeen = Infinity;
+      for (const [id, s] of this.sessions) {
+        if (s.lastSeen < oldestSeen) { oldestSeen = s.lastSeen; oldestId = id; }
+      }
+      if (oldestId != null) {
+        const s = this.sessions.get(oldestId);
+        this._sessionCounts[s.index] = Math.max(0, this._sessionCount(s.index) - 1);
+        this.sessions.delete(oldestId);
+      }
+    }
+    this.sessions.set(sessionId, { index, lastSeen: Date.now() });
+    this._sessionCounts[index] = this._sessionCount(index) + 1;
   }
 
   /**
@@ -177,26 +217,68 @@ export class AccountManager {
    * for every request that carries a session id. Sticky: the session's bound
    * account is returned for as long as it can serve the request (rate-limit
    * pauses do NOT unbind — admit() waits them out on the same account, keeping
-   * the cache). Rebinds only when the bound account is unavailable for this
-   * model or already failed this request (`exclude`). Requests with no session
-   * id — and fleets with affinity disabled — fall back to the legacy
-   * getActiveAccount walk unchanged.
+   * the cache). The binding is REBOUND only when the bound account is truly
+   * unavailable (disabled/error/throttled/shared quota spent). Everything
+   * transient or model-scoped is a DETOUR instead: the request is served by
+   * another account while the binding — and the warm cache behind it — stays
+   * put. Requests with no session id, and fleets with affinity disabled, take
+   * the legacy getActiveAccount walk unchanged.
    */
   getAccountForSession(sessionId, exclude = null, model = null, advisorModel = null) {
     if (!sessionId || !this.affinity.enabled) {
       return this.getActiveAccount(exclude, model, advisorModel);
     }
     this.refreshExpiredQuotas();
-    this._sweepSessions();
+    this._maybeSweepSessions();
+
+    // A manual route pin is an operator override and outranks affinity, exactly
+    // as it outranks the legacy current account. The binding is not rewritten:
+    // pins are ephemeral, so when the pin lifts the session returns to its own
+    // account (whose cache may still be live).
+    const pinned = this._pinnedAccountForModel(model, advisorModel);
+    if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinned.index)) {
+      return pinned;
+    }
+
     const bound = this.sessions.get(sessionId);
     if (bound) {
       const acct = this.accounts[bound.index];
-      if (acct && this._isAvailable(acct, model, advisorModel) && !exclude?.has(acct.index)) {
-        bound.lastSeen = Date.now();
-        return acct;
+      if (acct) {
+        const excluded = exclude?.has(acct.index);
+        if (!excluded && this._isAvailable(acct, model, advisorModel)) {
+          bound.lastSeen = Date.now();
+          return acct;
+        }
+        // Advisor degrade (soft, mirrors getActiveAccount): when the bound
+        // account can serve the executor but not the advisor model, staying
+        // put loses one advisor sub-call while moving would go cache-cold on
+        // the session's entire context — stay put.
+        if (!excluded && advisorModel && this._isAvailable(acct, model)) {
+          bound.lastSeen = Date.now();
+          return acct;
+        }
+        // DETOUR, not rebind: `exclude` is per-request transient (an account
+        // already tried this request is healthy for the next one — see
+        // forwardRequest), and a route/family-bucket bar is per-model (the
+        // account still serves the session's other models warm). In both cases
+        // the binding stays; only this request is served elsewhere. The detour
+        // target is deterministic (same selection key), so repeated detours
+        // land on the same account and warm it as a de-facto secondary.
+        if (excluded || this._isAvailable(acct)) {
+          bound.lastSeen = Date.now();
+          const detour = this._pickForNewSession(exclude, model, advisorModel)
+            || (advisorModel ? this._pickForNewSession(exclude, model, null) : null);
+          if (detour) return detour;
+          return this.getActiveAccount(exclude, model, advisorModel);
+        }
+        // Fall through: the account is truly unavailable → rebind below.
       }
     }
-    const pick = this._pickForNewSession(exclude, model, advisorModel);
+
+    let pick = this._pickForNewSession(exclude, model, advisorModel);
+    // Advisor degrade for placement too: never fail a session's placement over
+    // the advisor model when some account can serve the executor.
+    if (!pick && advisorModel) pick = this._pickForNewSession(exclude, model, null);
     if (!pick) {
       // Nothing eligible — run the legacy walk for its exhausted-fleet probe /
       // synthetic-429 handling. Deliberately not bound: the next request
@@ -204,11 +286,16 @@ export class AccountManager {
       return this.getActiveAccount(exclude, model, advisorModel);
     }
     if (bound && bound.index !== pick.index) {
+      // Mass-rebind pacing: when an account dies, its whole herd of bound
+      // sessions rebinds together — arm the target's ramp (only if one isn't
+      // already running) so admit() paces the burst like a legacy switch
+      // would (issue #84).
+      if (this.ramp.enabled && pick.rampStartedAt == null) this._beginRamp(pick);
       console.log(`[TeamClaude] Session ${sessionId.slice(0, 8)} rebound "${this.accounts[bound.index]?.name ?? '?'}" → "${pick.name}" (account unavailable — this session's prompt cache starts cold)`);
     } else if (!bound) {
       console.log(`[TeamClaude] Session ${sessionId.slice(0, 8)} → "${pick.name}" (${this._sessionCount(pick.index) + 1} bound, priority ${pick.priority || 0})`);
     }
-    this.sessions.set(sessionId, { index: pick.index, lastSeen: Date.now() });
+    this._bindSession(sessionId, pick.index);
     return pick;
   }
 
@@ -219,13 +306,18 @@ export class AccountManager {
    *      when every eligible account is full, the least-loaded still wins —
    *      requests must keep flowing),
    *   2. priority (operator drain order),
-   *   3. fewest bound sessions (spread within a tier),
-   *   4. fewest in-flight upstream requests,
-   *   5. soonest governing weekly reset (mirrors _pickBestAvailable).
+   *   3. not rate-limit-paused before paused (a paused account would hold the
+   *      session's first request in admit() while a same-tier sibling is idle;
+   *      ranked below priority so a short pause can't burn a reserve account
+   *      for the whole life of the binding),
+   *   4. fewest bound sessions (spread within a tier),
+   *   5. fewest in-flight upstream requests,
+   *   6. soonest governing weekly reset (mirrors _pickBestAvailable).
    */
   _pickForNewSession(exclude = null, model = null, advisorModel = null) {
     let best = null;
     let bestKey = null;
+    const now = Date.now();
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (!this._isAvailable(account, model, advisorModel)) continue;
@@ -233,6 +325,7 @@ export class AccountManager {
       const key = [
         load >= this.affinity.maxPerAccount ? 1 : 0,
         account.priority || 0,
+        account.pausedUntil && account.pausedUntil > now ? 1 : 0,
         load,
         account.inFlight || 0,
         this._governingWeeklyReset(account, model) || -Infinity,
@@ -1236,6 +1329,7 @@ export class AccountManager {
   addAccount(acctData) {
     const index = this.accounts.length;
     this.accounts.push(makeAccount(acctData, index));
+    this._sessionCounts.push(0);
     return index;
   }
 
@@ -1258,11 +1352,14 @@ export class AccountManager {
       else if (idx > index) this.routePins.set(name, idx - 1);
     }
     // Same for session bindings: unbind sessions on the removed account (they
-    // rebind on their next request), shift the ones above it.
+    // rebind on their next request), shift the ones above it. Counts are
+    // rebuilt wholesale — removal is rare and the map is capped.
     for (const [id, s] of [...this.sessions.entries()]) {
       if (s.index === index) this.sessions.delete(id);
       else if (s.index > index) s.index--;
     }
+    this._sessionCounts = new Array(this.accounts.length).fill(0);
+    for (const s of this.sessions.values()) this._sessionCounts[s.index]++;
   }
 
   /**
