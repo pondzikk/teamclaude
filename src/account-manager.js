@@ -88,8 +88,17 @@ function modelMatches(declared, model) {
   return declared === model || declared.replace(/\[\d+m\]$/, '') === model;
 }
 
+// Lexicographic compare for the selection keys _pickForNewSession builds.
+function keyLess(a, b) {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] < b[i]) return true;
+    if (a[i] > b[i]) return false;
+  }
+  return false;
+}
+
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp, affinity } = {}) {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
@@ -128,6 +137,109 @@ export class AccountManager {
     // retry-after, short enough that a stale hold cannot pin the fleet.
     this.throttleProbeFloorMs = throttleProbeFloorMs
       ?? (Number(process.env.TEAMCLAUDE_THROTTLE_PROBE_FLOOR_MS) || 60_000);
+    // Session affinity: cache-preserving load spreading. Anthropic's prompt
+    // cache is PER-ACCOUNT, so a session that hops accounts re-reads its whole
+    // context cold on every hop (10× input cost, huge TTFT). Affinity keeps
+    // each Claude Code session (keyed by metadata.user_id's session_id) pinned
+    // to ONE account for its lifetime and only rebinds when that account can no
+    // longer serve it (quota/disabled) — one unavoidable cold read, then warm
+    // again. Load is spread by placing NEW sessions (no cache anywhere yet) on
+    // the least-loaded account of the best priority tier, so concurrent
+    // sessions stop funneling onto the single global current account.
+    // `sessions` maps sessionId → { index, lastSeen }. Bindings idle past the
+    // TTL are swept: the upstream cache (≤1h) is cold by then anyway, so a
+    // returning session rebinds for free.
+    const aff = affinity || {};
+    this.affinity = {
+      enabled: process.env.TEAMCLAUDE_SESSION_AFFINITY === '0' ? false : aff.enabled !== false,
+      maxPerAccount: Number(process.env.TEAMCLAUDE_MAX_SESSIONS_PER_ACCOUNT) || aff.maxPerAccount || 8,
+      ttlMs: (Number(process.env.TEAMCLAUDE_SESSION_TTL_MINUTES) || aff.ttlMinutes || 60) * 60_000,
+    };
+    this.sessions = new Map();
+  }
+
+  /** Sessions currently bound to account `index` (the affinity load metric). */
+  _sessionCount(index) {
+    let n = 0;
+    for (const s of this.sessions.values()) if (s.index === index) n++;
+    return n;
+  }
+
+  /** Drop session bindings idle past the TTL. */
+  _sweepSessions(now = Date.now()) {
+    for (const [id, s] of this.sessions) {
+      if (now - s.lastSeen > this.affinity.ttlMs) this.sessions.delete(id);
+    }
+  }
+
+  /**
+   * Session-affine account selection — the cache-preserving entry point used
+   * for every request that carries a session id. Sticky: the session's bound
+   * account is returned for as long as it can serve the request (rate-limit
+   * pauses do NOT unbind — admit() waits them out on the same account, keeping
+   * the cache). Rebinds only when the bound account is unavailable for this
+   * model or already failed this request (`exclude`). Requests with no session
+   * id — and fleets with affinity disabled — fall back to the legacy
+   * getActiveAccount walk unchanged.
+   */
+  getAccountForSession(sessionId, exclude = null, model = null, advisorModel = null) {
+    if (!sessionId || !this.affinity.enabled) {
+      return this.getActiveAccount(exclude, model, advisorModel);
+    }
+    this.refreshExpiredQuotas();
+    this._sweepSessions();
+    const bound = this.sessions.get(sessionId);
+    if (bound) {
+      const acct = this.accounts[bound.index];
+      if (acct && this._isAvailable(acct, model, advisorModel) && !exclude?.has(acct.index)) {
+        bound.lastSeen = Date.now();
+        return acct;
+      }
+    }
+    const pick = this._pickForNewSession(exclude, model, advisorModel);
+    if (!pick) {
+      // Nothing eligible — run the legacy walk for its exhausted-fleet probe /
+      // synthetic-429 handling. Deliberately not bound: the next request
+      // re-picks once an account frees up.
+      return this.getActiveAccount(exclude, model, advisorModel);
+    }
+    if (bound && bound.index !== pick.index) {
+      console.log(`[TeamClaude] Session ${sessionId.slice(0, 8)} rebound "${this.accounts[bound.index]?.name ?? '?'}" → "${pick.name}" (account unavailable — this session's prompt cache starts cold)`);
+    } else if (!bound) {
+      console.log(`[TeamClaude] Session ${sessionId.slice(0, 8)} → "${pick.name}" (${this._sessionCount(pick.index) + 1} bound, priority ${pick.priority || 0})`);
+    }
+    this.sessions.set(sessionId, { index: pick.index, lastSeen: Date.now() });
+    return pick;
+  }
+
+  /**
+   * Place a NEW session (it has no warm cache anywhere, so placement is free).
+   * Selection order among available accounts:
+   *   1. under the per-account session cap before at/over it (soft cap:
+   *      when every eligible account is full, the least-loaded still wins —
+   *      requests must keep flowing),
+   *   2. priority (operator drain order),
+   *   3. fewest bound sessions (spread within a tier),
+   *   4. fewest in-flight upstream requests,
+   *   5. soonest governing weekly reset (mirrors _pickBestAvailable).
+   */
+  _pickForNewSession(exclude = null, model = null, advisorModel = null) {
+    let best = null;
+    let bestKey = null;
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index)) continue;
+      if (!this._isAvailable(account, model, advisorModel)) continue;
+      const load = this._sessionCount(account.index);
+      const key = [
+        load >= this.affinity.maxPerAccount ? 1 : 0,
+        account.priority || 0,
+        load,
+        account.inFlight || 0,
+        this._governingWeeklyReset(account, model) || -Infinity,
+      ];
+      if (!best || keyLess(key, bestKey)) { best = account; bestKey = key; }
+    }
+    return best;
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -1145,6 +1257,12 @@ export class AccountManager {
       if (idx === index) this.routePins.delete(name);
       else if (idx > index) this.routePins.set(name, idx - 1);
     }
+    // Same for session bindings: unbind sessions on the removed account (they
+    // rebind on their next request), shift the ones above it.
+    for (const [id, s] of [...this.sessions.entries()]) {
+      if (s.index === index) this.sessions.delete(id);
+      else if (s.index > index) s.index--;
+    }
   }
 
   /**
@@ -1181,12 +1299,20 @@ export class AccountManager {
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {
+    this._sweepSessions(); // report live bindings, not expired ones
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      sessionAffinity: {
+        enabled: this.affinity.enabled,
+        maxPerAccount: this.affinity.maxPerAccount,
+        ttlMinutes: Math.round(this.affinity.ttlMs / 60_000),
+        activeSessions: this.sessions.size,
+      },
       routes: this.getRoutes(),
       accounts: this.accounts.map(a => ({
         name: a.name,
+        sessions: this._sessionCount(a.index),
         type: a.type,
         orgName: a.orgName || null,
         priority: a.priority || 0,
