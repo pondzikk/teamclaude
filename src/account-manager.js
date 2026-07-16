@@ -302,17 +302,19 @@ export class AccountManager {
   /**
    * Place a NEW session (it has no warm cache anywhere, so placement is free).
    * Selection order among available accounts:
-   *   1. under the per-account session cap before at/over it (soft cap:
-   *      when every eligible account is full, the least-loaded still wins —
-   *      requests must keep flowing),
-   *   2. priority (operator drain order),
-   *   3. not rate-limit-paused before paused (a paused account would hold the
-   *      session's first request in admit() while a same-tier sibling is idle;
-   *      ranked below priority so a short pause can't burn a reserve account
-   *      for the whole life of the binding),
-   *   4. fewest bound sessions (spread within a tier),
-   *   5. fewest in-flight upstream requests,
-   *   6. soonest governing weekly reset (mirrors _pickBestAvailable).
+   * Two regimes, switched by whether the account is at/over the soft cap:
+   *   UNDER cap — drain order: [priority, not-paused, load, inFlight, weeklyReset].
+   *     Fill the operator's preferred (low-priority-value) account first.
+   *   OVER cap (every eligible account is already full — fleet saturated) — pure
+   *     LOAD balancing: [not-paused, load, inFlight, priority, weeklyReset].
+   *     Priority deliberately DROPS to a late tiebreak here: otherwise the
+   *     priority-0 "drain-first" account wins every overflow placement and becomes
+   *     a dumping ground — it collects every session past the cap, gets per-minute
+   *     rate-limited, and its sessions stall (a rate-limit 429 pauses+retries the
+   *     same account, never rotates) while lightly-loaded accounts sit idle. That
+   *     was the "one session 529s, the rest are fine" failure. Under cap the
+   *     leading 0 outranks any over-cap account's leading 1, so under-cap accounts
+   *     are always filled first and the two regimes never cross-compare by shape.
    */
   _pickForNewSession(exclude = null, model = null, advisorModel = null) {
     let best = null;
@@ -322,14 +324,14 @@ export class AccountManager {
       if (exclude?.has(account.index)) continue;
       if (!this._isAvailable(account, model, advisorModel)) continue;
       const load = this._sessionCount(account.index);
-      const key = [
-        load >= this.affinity.maxPerAccount ? 1 : 0,
-        account.priority || 0,
-        account.pausedUntil && account.pausedUntil > now ? 1 : 0,
-        load,
-        account.inFlight || 0,
-        this._governingWeeklyReset(account, model) || -Infinity,
-      ];
+      const over = load >= this.affinity.maxPerAccount;
+      const paused = account.pausedUntil && account.pausedUntil > now ? 1 : 0;
+      const prio = account.priority || 0;
+      const inFlight = account.inFlight || 0;
+      const reset = this._governingWeeklyReset(account, model) || -Infinity;
+      const key = over
+        ? [1, paused, load, inFlight, prio, reset]   // saturated → balance by load
+        : [0, prio, paused, load, inFlight, reset];  // normal → drain by priority
       if (!best || keyLess(key, bestKey)) { best = account; bestKey = key; }
     }
     return best;

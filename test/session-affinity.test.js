@@ -125,6 +125,20 @@ test('soft cap: all tiers full still routes (least-loaded wins)', () => {
   assert.strictEqual(m.sessions.size, 4);
 });
 
+test('over cap, overflow spreads by LOAD — priority-0 is not a dumping ground', () => {
+  // 3 accounts, priority 0/1/2, cap 2. Place 9 sessions. Under cap fills by
+  // priority (acct-0 first), but past the cap overflow must balance, NOT keep
+  // piling onto the priority-0 account. Expect an even 3/3/3, never 7/1/1.
+  const m = makeManager(3, { priorities: [0, 1, 2], affinity: { maxPerAccount: 2 } });
+  for (let i = 0; i < 9; i++) {
+    m.getAccountForSession(`00000000-0000-4000-8000-00000000000${i}`);
+  }
+  const counts = m._sessionCounts.slice().sort((a, b) => a - b);
+  assert.deepStrictEqual(counts, [3, 3, 3], `expected even 3/3/3, got ${m._sessionCounts}`);
+  // and specifically the priority-0 account must not have hoarded the overflow
+  assert.ok(m._sessionCounts[0] <= 3, 'priority-0 account over-concentrated');
+});
+
 test('rebinds when the bound account becomes unavailable, sticky afterwards', () => {
   const m = makeManager(2);
   const first = m.getAccountForSession(SID);
