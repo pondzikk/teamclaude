@@ -533,9 +533,29 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // account is futile — switch to another account now (updateQuota above
       // already recorded the spent bucket's utilization from the headers).
       const rl = rateLimitHeaders;
-      const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
-        || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
+      // A "rejected" unified status is treated as DURABLE quota exhaustion (bench
+      // the account for its whole reset window, up to 1h) ONLY when the account's
+      // own reported utilization confirms it (>= switchThreshold). Anthropic also
+      // returns rejected-status 429s for short-term burst / concurrency limits on
+      // accounts with ample quota left — observed live: an account at 27% 5h /
+      // 63% weekly thrown a 3600s "rejected" hold, which benched the LAST healthy
+      // account and produced a false "all accounts exhausted" (the account
+      // selection was working — the account had just been wrongly removed from
+      // rotation). updateQuota() above already recorded this response's
+      // utilization, so gate on it: a rejected status with utilization BELOW the
+      // threshold falls through to the transient rate-limit path (pause + retry
+      // the same account), keeping it selectable instead of benching it for an
+      // hour. Genuine exhaustion (utilization >= threshold) still throttles.
+      const thr = accountManager.switchThreshold;
+      const rejected5 = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected';
+      const rejected7 = rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
+      const u5 = account.quota.unified5h ?? 0;
+      const u7 = account.quota.unified7d ?? 0;
+      const generalRejected = (rejected5 && u5 >= thr) || (rejected7 && u7 >= thr);
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
+      if ((rejected5 || rejected7) && !generalRejected && !fableRejected) {
+        console.log(`[TeamClaude] Rejected-status 429 on "${account.name}" but utilization is below threshold (5h ${(u5 * 100).toFixed(0)}%, 7d ${(u7 * 100).toFixed(0)}%, thr ${(thr * 100).toFixed(0)}%) — burst/concurrency, NOT quota exhaustion; keeping account in rotation (transient rate-limit)`);
+      }
       if ((generalRejected || fableRejected) && retryCount < maxRetries) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes

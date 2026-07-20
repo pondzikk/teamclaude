@@ -162,6 +162,9 @@ test('a quota-rejection 429 rotates to the next account', async () => {
       res.writeHead(429, {
         'retry-after': '60',
         'anthropic-ratelimit-unified-5h-status': 'rejected',
+        // Utilization must confirm the rejection is durable quota exhaustion
+        // (>= switchThreshold); only then does the account get benched + rotated.
+        'anthropic-ratelimit-unified-5h-utilization': '0.99',
         'content-type': 'application/json',
       });
       res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
@@ -188,6 +191,44 @@ test('a quota-rejection 429 rotates to the next account', async () => {
     assert.equal(res.status, 200, 'should succeed on the second account');
     assert.equal(am.accounts[0].status, 'throttled', 'exhausted account is throttled (rotated away)');
     assert.ok(seen.includes('Bearer t-b'), 'request rotated to account b');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// A "rejected" unified status with LOW utilization is a burst/concurrency limit,
+// NOT durable quota exhaustion. The account must NOT be benched for its whole
+// reset window (up to 1h) — that would wrongly remove a healthy account from
+// rotation and can produce a false "all accounts exhausted". It should stay
+// selectable (transient rate-limit path: paused, not throttled).
+test('a rejected-status 429 with LOW utilization is NOT benched (stays in rotation)', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(429, {
+      'retry-after': '300',
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+      'anthropic-ratelimit-unified-5h-utilization': '0.20', // healthy — burst, not quota
+      'content-type': 'application/json',
+    });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.notEqual(am.accounts[0].status, 'throttled', 'low-utilization rejection must NOT bench the account');
+    assert.equal(am.accounts[0].status, 'active', 'account stays active (selectable)');
+    assert.ok(am.accounts[0].pausedUntil, 'went the transient rate-limit path (paused, not throttled)');
   } finally {
     proxy.close();
     upstream.close();
