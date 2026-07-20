@@ -1,3 +1,13 @@
+> **Fork of [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude)** (MIT). Additions on top of upstream:
+> - **Session affinity** — pins each Claude Code session to one account to keep its per-account prompt cache warm, load-balancing *across* sessions instead of rotating mid-session.
+> - **HTTP/1.1-only upstream dispatcher** — undici's HTTP/2 default multiplexed every request over one connection, serializing the whole fleet under concurrency; H1 restores per-request connections.
+> - **Load-balanced overflow** — past the per-account session cap, new sessions spread by load instead of piling onto the priority-0 account.
+> - **Utilization-gated rate-limit classification** — a `rejected`-status 429 only benches an account when its reported utilization confirms real quota exhaustion, not a transient burst/concurrency limit.
+>
+> See commit history for details. Original upstream README follows.
+
+---
+
 # TeamClaude
 
 [![CI](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml)
