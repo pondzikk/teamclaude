@@ -75,6 +75,27 @@ test('reserve on: legacy _pickBestAvailable path also steers non-Fable to Fable-
   assert.strictEqual(m._pickBestAvailable(null, FABLE).name, 'a1', 'Fable via legacy path picks the capable account');
 });
 
+test('reserve on: legacy no-session path switches OFF a Fable-capable sticky current', () => {
+  const m = mgr(true, [0.99, 0.30]); // a0 Fable spent, a1 Fable room
+  m.currentIndex = 1;                 // a Fable request would have planted a1 as current
+  assert.strictEqual(m.getActiveAccount(null, OPUS).name, 'a0',
+    'no-session non-Fable must not stick to the Fable-capable current; it switches to the Fable-spent a0');
+});
+
+test('reserve on: legacy path stays on current when NO non-reserved account exists (soft, no thrash)', () => {
+  const m = mgr(true, [0.30, 0.30]); // both Fable-capable → both reserved for non-Fable
+  m.currentIndex = 0;
+  assert.strictEqual(m.getActiveAccount(null, OPUS).name, 'a0',
+    'with no Fable-spent alternative, the sticky current is kept — reserve does not thrash');
+});
+
+test('reserve OFF: legacy sticky-current is byte-identical (stays on current)', () => {
+  const m = mgr(false, [0.99, 0.30]);
+  m.currentIndex = 1;                 // Fable-capable, but feature off
+  assert.strictEqual(m.getActiveAccount(null, OPUS).name, 'a1',
+    'reserve off → no switch, sticks to current a1');
+});
+
 test('reserve off is the default (no reserveFableAccounts option)', () => {
   const accounts = [{ name: 'x', type: 'api', apiKey: 'k' }];
   const m = new AccountManager(accounts, 0.98, { refreshFn: noRefresh });

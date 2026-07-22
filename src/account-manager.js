@@ -507,7 +507,18 @@ export class AccountManager {
       // never thrashes — preemption only triggers when priorities differ.
       const betterExists = this.accounts.some(a =>
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
-      return betterExists ? this._selectNext(exclude, model, advisorModel) : current;
+      // Fable-reserve on the sticky-current path: if `current` is one we want to
+      // spare for Fable (still has Fable headroom, and this is a non-Fable
+      // request) AND some non-reserved account can take this request, switch away
+      // via _selectNext (whose _pickBestAvailable prefers the Fable-spent account)
+      // rather than draining current's shared quota. Without this, a no-session /
+      // affinity-off request would pin to whatever currentIndex holds and the
+      // reserve would never engage on the legacy path. No-op when reserve is off
+      // (_reservesFable → false), so default behaviour is byte-identical.
+      const reserveElsewhere = this._reservesFable(current, model, advisorModel)
+        && this.accounts.some(a => this._isAvailable(a, model, advisorModel)
+          && !exclude?.has(a.index) && !this._reservesFable(a, model, advisorModel));
+      return (betterExists || reserveElsewhere) ? this._selectNext(exclude, model, advisorModel) : current;
     }
     const next = this._selectNext(exclude, model, advisorModel);
     if (next) return next;
