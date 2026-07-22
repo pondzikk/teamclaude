@@ -1449,6 +1449,7 @@ export class AccountManager {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      reserveFable: this.reserveFable,
       sessionAffinity: {
         enabled: this.affinity.enabled,
         maxPerAccount: this.affinity.maxPerAccount,
