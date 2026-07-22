@@ -553,8 +553,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const u7 = account.quota.unified7d ?? 0;
       const generalRejected = (rejected5 && u5 >= thr) || (rejected7 && u7 >= thr);
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
+      if (rejected5 || rejected7 || fableRejected) {
+        console.log(`[TeamClaude] 429 classify "${account.name}": 5h-status=${rl['anthropic-ratelimit-unified-5h-status'] || '-'} util=${rl['anthropic-ratelimit-unified-5h-utilization'] ?? '?'}(stored ${(u5 * 100).toFixed(0)}%) | 7d-status=${rl['anthropic-ratelimit-unified-7d-status'] || '-'} util=${rl['anthropic-ratelimit-unified-7d-utilization'] ?? '?'}(stored ${(u7 * 100).toFixed(0)}%) | retry-after=${retryAfter}s → ${generalRejected ? 'GENUINE-bench' : fableRejected ? 'fable-only' : 'transient-KEEP'}`);
+      }
       if ((rejected5 || rejected7) && !generalRejected && !fableRejected) {
-        console.log(`[TeamClaude] Rejected-status 429 on "${account.name}" but utilization is below threshold (5h ${(u5 * 100).toFixed(0)}%, 7d ${(u7 * 100).toFixed(0)}%, thr ${(thr * 100).toFixed(0)}%) — burst/concurrency, NOT quota exhaustion; keeping account in rotation (transient rate-limit)`);
+        console.log(`[TeamClaude] Rejected-status 429 on "${account.name}" but utilization is below threshold — burst/concurrency, NOT quota exhaustion; keeping account in rotation (transient rate-limit)`);
       }
       if ((generalRejected || fableRejected) && retryCount < maxRetries) {
         // A Fable-only rejection leaves the account fine for other models, so we

@@ -1,6 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, isFableModel } from './model.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -98,7 +98,7 @@ function keyLess(a, b) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp, affinity } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp, affinity, reserveFableAccounts } = {}) {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
@@ -158,6 +158,20 @@ export class AccountManager {
       // `claude -p` is a fresh id), so TTL alone can't bound the map.
       maxTracked: Number(process.env.TEAMCLAUDE_MAX_TRACKED_SESSIONS) || aff.maxTracked || 5000,
     };
+    // Fable-reserve: Fable meters its OWN small weekly bucket, separate from the
+    // shared 5h/weekly. Once most accounts' Fable bucket is spent, only the few
+    // accounts that still have Fable headroom can serve Fable — but nothing stops
+    // ordinary Opus/Sonnet traffic from landing on exactly those accounts and
+    // burning their SHARED 5h/weekly quota to zero, which takes them out for
+    // EVERYTHING including Fable. With this on, a NON-Fable request de-prioritizes
+    // any account that still has Fable headroom, steering general traffic onto
+    // accounts whose Fable is already exhausted (they can't serve Fable anyway).
+    // Soft: it's only a ranking preference — when the Fable-spent accounts are
+    // themselves unavailable, non-Fable traffic still falls through to a
+    // Fable-capable one rather than being blocked.
+    this.reserveFable = process.env.TEAMCLAUDE_RESERVE_FABLE === '1' ? true
+      : process.env.TEAMCLAUDE_RESERVE_FABLE === '0' ? false
+      : !!reserveFableAccounts;
     this.sessions = new Map();
     // Bound-session count per account index, maintained incrementally by
     // _bindSession/_sweepSessions so placement never scans the whole map.
@@ -300,6 +314,22 @@ export class AccountManager {
   }
 
   /**
+   * True when this account should be de-prioritized for the given request in
+   * order to keep its Fable capacity in reserve (see this.reserveFable). Applies
+   * ONLY to non-Fable requests: a request that IS Fable (executor OR advisor)
+   * must be free to use a Fable-capable account. An account "still has Fable" when
+   * its Fable weekly bucket is known and below the switch threshold. Unknown
+   * (null) Fable utilization is treated as NOT reserved — we don't penalize an
+   * account whose Fable status we haven't learned yet.
+   */
+  _reservesFable(account, model = null, advisorModel = null) {
+    if (!this.reserveFable) return false;
+    if (isFableModel(model) || isFableModel(advisorModel)) return false;
+    const f = account.quota.unified7dFable;
+    return f != null && f < this.switchThreshold;
+  }
+
+  /**
    * Place a NEW session (it has no warm cache anywhere, so placement is free).
    * Selection order among available accounts:
    * Two regimes, switched by whether the account is at/over the soft cap:
@@ -329,9 +359,15 @@ export class AccountManager {
       const prio = account.priority || 0;
       const inFlight = account.inFlight || 0;
       const reset = this._governingWeeklyReset(account, model) || -Infinity;
+      // Fable-reserve is the PRIMARY discriminator (see _reservesFable): a
+      // non-Fable request prefers every Fable-spent account over every
+      // Fable-capable one, so general traffic doesn't drain the accounts that are
+      // still Fable's only home. Always 0 when the feature is off / for Fable
+      // requests, so the ranking is otherwise unchanged.
+      const reserve = this._reservesFable(account, model, advisorModel) ? 1 : 0;
       const key = over
-        ? [1, paused, load, inFlight, prio, reset]   // saturated → balance by load
-        : [0, prio, paused, load, inFlight, reset];  // normal → drain by priority
+        ? [reserve, 1, paused, load, inFlight, prio, reset]   // saturated → balance by load
+        : [reserve, 0, prio, paused, load, inFlight, reset];  // normal → drain by priority
       if (!best || keyLess(key, bestKey)) { best = account; bestKey = key; }
     }
     return best;
@@ -996,8 +1032,7 @@ export class AccountManager {
    */
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
     let best = null;
-    let bestPriority = Infinity;
-    let bestReset = Infinity;
+    let bestKey = null;
 
     for (let i = 0; i < this.accounts.length; i++) {
       const account = this.accounts[i];
@@ -1007,18 +1042,19 @@ export class AccountManager {
       // is still below 98%.
       if (!this._isAvailable(account, model, advisorModel)) continue;
 
+      // Fable-reserve first (see _reservesFable): for a non-Fable request, an
+      // account that still has Fable headroom sorts AFTER every Fable-spent one,
+      // so general traffic doesn't drain Fable's last homes. 0 for everyone when
+      // the feature is off / for Fable requests → order unchanged below.
+      const reserve = this._reservesFable(account, model, advisorModel) ? 1 : 0;
       const priority = account.priority || 0;
       // Rank by the reset of the weekly bucket that governs THIS model (Fable and
       // Sonnet have their own), so a Fable request spends the account whose Fable
       // window refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
       const weeklyReset = this._governingWeeklyReset(account, model) || -Infinity;
-      if (priority < bestPriority ||
-          (priority === bestPriority && weeklyReset < bestReset)) {
-        bestPriority = priority;
-        bestReset = weeklyReset;
-        best = account;
-      }
+      const key = [reserve, priority, weeklyReset];
+      if (!best || keyLess(key, bestKey)) { best = account; bestKey = key; }
     }
     return best;
   }
