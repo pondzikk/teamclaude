@@ -50,6 +50,14 @@ function makeAccount(acct, index) {
     priority: acct.priority || 0,
     disabled: acct.disabled || false,
     upstream: acct.upstream || null,
+    // Wire protocol the upstream speaks. 'openai' routes this account's
+    // /v1/messages traffic through the Chat Completions translator
+    // (src/openai-translate.js); anything else — including the default null —
+    // means the native Anthropic Messages API and behaves exactly as before.
+    protocol: acct.protocol === 'openai' ? 'openai' : null,
+    // Ask an OpenAI backend for token usage on streaming responses
+    // (stream_options.include_usage); set false for a backend that rejects it.
+    streamUsage: acct.streamUsage !== false,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
     // that reject e.g. `context_management`). See server.js stripBodyFields.

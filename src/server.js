@@ -10,6 +10,10 @@ import { TopLevelFieldFinder } from './model.js';
 import { SessionIdFinder } from './session-id.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
+import {
+  anthropicToOpenAIRequest, openAIToAnthropicResponse, openAIToAnthropicError,
+  translateOpenAIStream, openAIChatCompletionsUrl,
+} from './openai-translate.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -428,6 +432,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
+  // Accounts whose backend speaks the OpenAI Chat Completions API instead of
+  // the Anthropic Messages API (config: `"protocol": "openai"`). Only the
+  // Messages endpoint itself is translated — anything else on such an account
+  // still passes through untouched. Every branch below is gated on this flag,
+  // so Anthropic accounts behave exactly as before.
+  const isOpenAI = account.protocol === 'openai';
+  const reqPath = (req.url || '').split('?')[0];
+  const translateOpenAI = isOpenAI && reqPath === '/v1/messages';
+
   // Build upstream request headers
   const isOAuth = account.type === 'oauth';
   const headers = {};
@@ -441,16 +454,28 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Strip accept-encoding: Node fetch auto-decompresses, which would
     // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
+    // An OpenAI backend has no idea what anthropic-version / anthropic-beta
+    // mean; some reject the whole request over an unknown header.
+    if (isOpenAI && lk.startsWith('anthropic-')) continue;
     headers[key] = value;
   }
 
-  if (isOAuth) {
+  if (isOpenAI) {
+    // OpenAI-compatible backends authenticate with a bearer token regardless
+    // of whether the credential came from an apikey or oauth account.
+    headers['authorization'] = `Bearer ${account.credential}`;
+  } else if (isOAuth) {
     headers['authorization'] = `Bearer ${account.credential}`;
   } else {
     headers['x-api-key'] = account.credential;
   }
 
-  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
+  const upstreamBase = account.upstream || upstream;
+  // The client hit `/v1/messages?beta=true`; an OpenAI backend serves
+  // `<base>/v1/chat/completions`, so the path is replaced, not appended.
+  const upstreamUrl = translateOpenAI
+    ? openAIChatCompletionsUrl(upstreamBase)
+    : `${upstreamBase}${req.url}`;
   const method = req.method;
 
   // Align the body's account_uuid (in metadata.user_id) with the account whose
@@ -467,6 +492,31 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // refreshed below because the body shrinks.
   if (Array.isArray(account.stripRequestFields) && account.stripRequestFields.length) {
     sendBody = stripBodyFields(sendBody, account.stripRequestFields);
+  }
+  // Anthropic Messages → OpenAI Chat Completions, for `protocol: "openai"`
+  // accounts only. Runs last so modelMap/stripRequestFields still apply first.
+  let openAIModel = null;
+  if (translateOpenAI) {
+    try {
+      const oaiReq = anthropicToOpenAIRequest(sendBody, { includeUsage: account.streamUsage !== false });
+      openAIModel = oaiReq.model;
+      sendBody = Buffer.from(JSON.stringify(oaiReq), 'utf8');
+      headers['content-type'] = 'application/json';
+    } catch (err) {
+      // A body we can't translate would otherwise be posted verbatim to
+      // /chat/completions; fail loudly instead (and don't burn other accounts
+      // on a retry — the same body would fail there too).
+      console.error(`[TeamClaude] OpenAI request translation failed (account "${account.name}"):`, err.message);
+      ctx.status = 400;
+      if (!res.headersSent) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'invalid_request_error', message: `Cannot translate request for OpenAI backend: ${err.message}` },
+        }));
+      }
+      return;
+    }
   }
   // If the body changed length (model name rewrite), update Content-Length so the
   // upstream doesn't receive a mismatched framing and truncate or stall.
@@ -670,10 +720,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      // An OpenAI backend's SSE is re-framed into Anthropic events first, so
+      // the client (and streamResponse's usage parser) sees the shape it
+      // expects. Input tokens only appear in OpenAI's final chunk, long after
+      // our message_start went out, so they're accounted for separately here.
+      const responseStream = translateOpenAI
+        ? translateOpenAIStream(upstreamRes.body, {
+          model: openAIModel,
+          onUsage: (u) => accountManager.updateUsage(account.index, u.input_tokens || 0, 0),
+        })
+        : upstreamRes.body;
+      await streamResponse(responseStream, res, account.index, accountManager, bw);
       l?.end();
     } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      let buf = Buffer.from(await upstreamRes.arrayBuffer());
+      if (translateOpenAI) buf = translateOpenAIBody(buf, upstreamRes.status, openAIModel);
       extractUsageFromBody(buf, account.index, accountManager);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
@@ -854,6 +915,19 @@ function parseSSEUsage(event, accountIndex, accountManager) {
   } catch {
     // not valid JSON, skip
   }
+}
+
+// Re-shape a buffered (non-streaming) OpenAI response body into the Anthropic
+// shape. A 2xx becomes a Messages response; anything else becomes an Anthropic
+// error envelope. A body we can't parse is passed through untouched.
+// Exported for tests.
+export function translateOpenAIBody(buf, status, model) {
+  let json;
+  try { json = JSON.parse(buf.toString('utf8')); } catch { return buf; }
+  const translated = (status >= 200 && status < 300)
+    ? openAIToAnthropicResponse(json, model)
+    : openAIToAnthropicError(json);
+  return Buffer.from(JSON.stringify(translated), 'utf8');
 }
 
 function extractUsageFromBody(buffer, accountIndex, accountManager) {
