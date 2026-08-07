@@ -447,7 +447,11 @@ export class OpenAIToAnthropicStream {
     out += sse('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: this.usage.output_tokens },
+      usage: {
+        input_tokens: this.usage.input_tokens,
+        output_tokens: this.usage.output_tokens,
+        ...(this.usage.cache_read_input_tokens ? { cache_read_input_tokens: this.usage.cache_read_input_tokens } : {}),
+      },
     });
     out += sse('message_stop', { type: 'message_stop' });
     this.finished = true;
