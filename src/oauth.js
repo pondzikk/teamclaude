@@ -1,16 +1,46 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
+import { proxyFetch } from './upstream-fetch.js';
+
+const execFileAsync = promisify(execFile);
+
+const DEFAULT_CREDENTIALS_PATH = '~/.claude/.credentials.json';
+const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+
+/**
+ * Read Claude Code credentials from the macOS Keychain, where Claude Code
+ * stores them on darwin (there is no ~/.claude/.credentials.json on macOS).
+ */
+async function readKeychainCredentials() {
+  const { stdout } = await execFileAsync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w']);
+  return JSON.parse(stdout.trim());
+}
 
 /**
  * Import OAuth credentials from a Claude Code credentials file.
+ * On macOS the default credentials location is the Keychain, not a file, so
+ * when the default path is missing the Keychain is tried before giving up.
  */
-export async function importCredentials(filePath) {
-  const resolvedPath = filePath.replace(/^~/, homedir());
-  const raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
+export async function importCredentials(filePath, {
+  home = homedir(), platform = process.platform, readKeychain = readKeychainCredentials } = {}) {
+  const resolvedPath = filePath.replace(/^~/, home);
+  let raw;
+  try {
+    raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
+  } catch (err) {
+    const isDefaultPath = resolvedPath === DEFAULT_CREDENTIALS_PATH.replace(/^~/, home);
+    if (err.code !== 'ENOENT' || platform !== 'darwin' || !isDefaultPath) throw err;
+    try {
+      raw = await readKeychain();
+    } catch (kcErr) {
+      throw new Error(`${err.message}; macOS Keychain lookup for "${KEYCHAIN_SERVICE}" also failed: ${kcErr.message}`);
+    }
+  }
 
   // Claude Code stores credentials nested under "claudeAiOauth"
   const data = raw.claudeAiOauth || raw;
@@ -49,7 +79,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         await new Promise(resolve => setTimeout(resolve, delay));
       }
 
-      const res = await fetch(endpoint, {
+      const res = await proxyFetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -137,7 +167,7 @@ export function isTokenExpired(expiresAt) {
  */
 export async function fetchProfile(accessToken) {
   try {
-    const res = await fetch(PROFILE_URL, {
+    const res = await proxyFetch(PROFILE_URL, {
       headers: { 'Authorization': `Bearer ${accessToken}` },
     });
     if (!res.ok) {
@@ -217,7 +247,7 @@ export function normalizeUsageBucket(bucket) {
  */
 export async function fetchUsage(accessToken) {
   try {
-    const res = await fetch(USAGE_URL, {
+    const res = await proxyFetch(USAGE_URL, {
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'anthropic-beta': OAUTH_USAGE_BETA,
@@ -293,7 +323,7 @@ export async function loginOAuth() {
 
   // Exchange code for tokens
   console.log('Exchanging authorization code for tokens...');
-  const tokenRes = await fetch(DEFAULT_TOKEN_ENDPOINT, {
+  const tokenRes = await proxyFetch(DEFAULT_TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

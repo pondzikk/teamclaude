@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
+import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
 
 export function getConfigPath() {
   if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
@@ -18,6 +19,15 @@ export function getConfigPath() {
 export function getStatePath() {
   const cfg = getConfigPath();
   return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.state.json') : cfg + '.state';
+}
+
+/**
+ * Path to the crash log (a sibling of the config), where a fatal error is
+ * recorded before the process exits.
+ */
+export function getCrashLogPath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '-crash.log') : cfg + '-crash.log';
 }
 
 export async function loadState() {
@@ -46,6 +56,10 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
+    holdSeconds: 0,
+    distributeSessions: false,
+    eventLogging: 'hide',
+    blockedModels: [],
     accounts: [],
   };
 }
@@ -53,10 +67,34 @@ export function createDefaultConfig() {
 export async function loadConfig() {
   const path = getConfigPath();
   try {
-    return JSON.parse(await readFile(path, 'utf-8'));
+    const config = JSON.parse(await readFile(path, 'utf-8'));
+    applyUpstreamProxy(config);
+    return config;
   } catch (err) {
     if (err.code === 'ENOENT') return null;
     throw err;
+  }
+}
+
+/**
+ * Publish the config's egress proxy to the process-wide setting.
+ *
+ * Done here, in the one place every command loads its config, rather than at
+ * each of the sixteen call sites: `login`, `import`, `accounts`, `probe` and the
+ * server all reach the network, and a proxy that applied to only some of them
+ * would be worse than none — the account list would refresh while logging in
+ * failed, or vice versa.
+ *
+ * A bad value is fatal on purpose. Falling back to a direct connection on a host
+ * that has no route to the internet would turn one clear error into a pile of
+ * ETIMEDOUTs pointing nowhere near the typo that caused them.
+ */
+function applyUpstreamProxy(config) {
+  try {
+    setUpstreamProxy(resolveUpstreamProxy(config));
+  } catch (err) {
+    console.error(`[TeamClaude] Bad proxy setting in ${getConfigPath()}: ${err.message}`);
+    process.exit(1);
   }
 }
 

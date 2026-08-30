@@ -1,6 +1,6 @@
 {
   "name": "@karpeleslab/teamclaude",
-  "version": "1.1.7",
+  "version": "1.1.13",
   "description": "Multi-account Claude proxy with automatic quota-based rotation",
   "type": "module",
   "main": "src/index.js",
@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test",
+    "test": "node --test --test-timeout=120000",
     "lint": "eslint ."
   },
   "keywords": [
@@ -32,12 +32,9 @@
   },
   "homepage": "https://github.com/KarpelesLab/teamclaude#readme",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "devDependencies": {
     "eslint": "^9.0.0"
-  },
-  "dependencies": {
-    "undici": "^8.7.0"
   }
 }

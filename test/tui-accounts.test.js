@@ -31,10 +31,11 @@ function makeTUI({ accounts = [{ name: 'a', index: 0, type: 'oauth', credential:
 const type = (tui, s) => { for (const ch of s) tui._key(ch); };
 const settle = () => new Promise(r => setTimeout(r, 5)); // let async handlers finish
 
-// Settings rows: threshold(0), probe(1), routes(2), addAccount(3), removeAccount(4).
-function openSettingsRow(tui, row) {
+// Open a settings row by its field id (robust to fields being added/reordered).
+function openSettingsRow(tui, id) {
   tui._key('g');
-  for (let i = 0; i < row; i++) tui._key('down');
+  const idx = tui._settingsFields().findIndex(f => f.id === id);
+  for (let i = 0; i < idx; i++) tui._key('down');
   tui._key('enter');
 }
 
@@ -77,7 +78,7 @@ test('a probe failure is logged, and a re-press probes again', async () => {
 
 test('settings → Add account → API key adds the account and returns to settings', async () => {
   const { tui, am, config, calls } = makeTUI();
-  openSettingsRow(tui, 3);
+  openSettingsRow(tui, 'addAccount');
   assert.equal(tui.mode, 'add');
   tui._key('k'); // API key path
   assert.equal(tui.mode, 'input');
@@ -92,7 +93,7 @@ test('settings → Add account → API key adds the account and returns to setti
 
 test('Esc backs out of the add chooser to settings', () => {
   const { tui } = makeTUI();
-  openSettingsRow(tui, 3);
+  openSettingsRow(tui, 'addAccount');
   tui._key('esc');
   assert.equal(tui.mode, 'settings');
 });
@@ -104,7 +105,7 @@ test('settings → Remove account removes the picked account and returns to sett
       { name: 'b', index: 1, type: 'oauth', credential: 't' },
     ],
   });
-  openSettingsRow(tui, 4);
+  openSettingsRow(tui, 'removeAccount');
   assert.equal(tui.mode, 'select');
   assert.equal(tui.selAction, 'remove');
   tui._key('down'); // pick "b"
@@ -122,9 +123,52 @@ test('the Remove account row is absent with no accounts, and Esc from remove-sel
   assert.ok(none.tui._settingsFields().some(f => f.id === 'addAccount')); // add still offered
 
   const { tui } = makeTUI();
-  openSettingsRow(tui, 4);
+  openSettingsRow(tui, 'removeAccount');
   tui._key('esc');
   assert.equal(tui.mode, 'settings');
+});
+
+test('Event logging setting cycles show → hide → block and writes config', async () => {
+  const { tui, config } = makeTUI();
+  config.eventLogging = 'hide';
+  await tui._cycleEventLogging(+1); // hide → block
+  assert.equal(config.eventLogging, 'block');
+  await tui._cycleEventLogging(+1); // block → show
+  assert.equal(config.eventLogging, 'show');
+  await tui._cycleEventLogging(-1); // show → block
+  assert.equal(config.eventLogging, 'block');
+});
+
+test('Blocked models editor: add a glob then delete it, persisting each change', async () => {
+  const { tui, config } = makeTUI();
+  openSettingsRow(tui, 'blocklist');
+  assert.equal(tui.mode, 'blocklist');
+
+  tui._key('a'); // add
+  assert.equal(tui.mode, 'input');
+  type(tui, '*fable*');
+  tui._key('enter');
+  await settle();
+  assert.deepEqual(config.blockedModels, ['*fable*']);
+  assert.equal(tui.mode, 'blocklist');
+
+  tui._key('d'); // delete the selected entry
+  await settle();
+  assert.deepEqual(config.blockedModels, []);
+
+  tui._key('esc');
+  assert.equal(tui.mode, 'settings');
+});
+
+test('Blocked models editor: a duplicate glob is not added twice', async () => {
+  const { tui, config } = makeTUI();
+  config.blockedModels = ['*fable*'];
+  openSettingsRow(tui, 'blocklist');
+  tui._key('a');
+  type(tui, '*fable*');
+  tui._key('enter');
+  await settle();
+  assert.deepEqual(config.blockedModels, ['*fable*']);
 });
 
 test('select mode entered from the dashboard still returns to normal', () => {
@@ -133,4 +177,39 @@ test('select mode entered from the dashboard still returns to normal', () => {
   assert.equal(tui.mode, 'select');
   tui._key('esc');
   assert.equal(tui.mode, 'normal');
+});
+
+// Importing the credentials of a second organization must not swallow the first.
+// Both entries are named from the same email, so matching on the name alone drops
+// one from the config and — worse here — rewrites the surviving in-memory
+// account's accountUuid/orgUuid, collapsing two live accounts into one without
+// even a restart.
+test('importing a second org adds an account instead of overwriting the first', async () => {
+  const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
+  const { tui, am, config, calls } = makeTUI({ accounts });
+  config.accounts = [{ name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
+  tui._readCredentials = async () => ({ accessToken: 'new', refreshToken: 'r', expiresAt: Date.now() + 3600_000 });
+  tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
+
+  await tui._doImport();
+
+  assert.equal(config.accounts.length, 2);
+  assert.equal(calls.added.length, 1);
+  assert.equal(am.accounts[0].orgUuid, 'o-personal');       // the running account kept its identity
+  assert.equal(am.accounts[0].credential, 'old');           // and its own token
+  assert.deepEqual(config.accounts.map(a => a.name), ['a@x.com (Personal)', 'a@x.com (Acme)']);
+});
+
+test('re-importing the same account+org still updates in place', async () => {
+  const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
+  const { tui, am, config, calls } = makeTUI({ accounts });
+  config.accounts = [{ name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
+  tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
+  tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
+
+  await tui._doImport();
+
+  assert.equal(config.accounts.length, 1);
+  assert.equal(calls.added.length, 0);
+  assert.equal(am.accounts[0].credential, 'fresh');
 });

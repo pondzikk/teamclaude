@@ -9,36 +9,27 @@
 // `status`, `headers.get()/.entries()`, `text()`, `arrayBuffer()`, and `body`
 // (a web ReadableStream, so streamResponse()'s getReader()/cancel() is untouched).
 
+import http from 'node:http';
 import https from 'node:https';
-import { Readable } from 'node:stream';
+import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
-import { fetch as undiciFetch, Agent } from 'undici';
+import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 
-// Parallelize upstream connections (fork change; drops the upstream project's
-// zero-dependency constraint). Node's built-in fetch multiplexes every request
-// to one origin over a SINGLE connection (H2), and the upstream's
-// per-connection concurrent-stream budget then serializes the whole fleet:
-// with a dozen long-lived SSE completions in flight, a tiny request queues for
-// minutes inside the dispatcher (measured on the live proxy: 90s+ TTFB while
-// the same account answered a direct curl in <1s; lsof showed exactly ONE
-// ESTABLISHED connection to api.anthropic.com carrying 14 in-flight requests).
-// Claude Code run DIRECT is smooth precisely because every process gets its own
-// connection — so give the proxy what direct has: plain HTTP/1.1, one in-flight
-// request per connection, a wide connection budget. npm undici's
-// setGlobalDispatcher does NOT reach Node's built-in fetch (separate
-// registries), so the dispatcher is passed explicitly to undici's own fetch.
-const UPSTREAM_AGENT = new Agent({
-  // CRITICAL: undici 8 defaults allowH2 to true (lib/core/connect.js:
-  // `allowH2 = allowH2 != null ? allowH2 : true`), which ALPN-negotiates h2 and
-  // multiplexes EVERYTHING over one connection again — `connections` then never
-  // grows the pool. H1-only is the whole point of this agent.
-  allowH2: false,
-  connections: 1024,       // effectively one connection per concurrent stream
-  pipelining: 1,           // never queue a request behind another on a socket
-  keepAliveTimeout: 30_000,
-  keepAliveMaxTimeout: 600_000,
-});
-console.log('[TeamClaude] upstream dispatcher: undici H1-only, connections=1024, pipelining=1');
+// Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
+// multiplexes ALL requests to an origin over a SINGLE HTTP/2 connection; under
+// many concurrent large uploads (Claude Code POSTs ~1MB of context per turn)
+// that one connection serializes on HTTP/2's shared flow-control windows —
+// api.anthropic.com advertises maxConcurrentStreams=100 (not the limit) but only
+// a 64KB initial window, so concurrent uploads queue behind WINDOW_UPDATEs and a
+// trivial request can wait minutes for headers (issue #106). Independent HTTP/1.1
+// connections have no application-layer flow control: each upload fills its own
+// socket at TCP speed, exactly like N direct Claude Code processes. maxSockets is
+// per-origin and bounds the fan-out. Escape hatch:
+// TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
+const MAX_SOCKETS = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS) || 256;
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
+const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH || '');
 
 // Time to wait for RESPONSE HEADERS before treating the upstream socket as dead.
 // This is NOT a limit on the response body (SSE completions can stream for
@@ -94,32 +85,71 @@ function headersTimeoutError(ms) {
 export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
   const { headersTimeoutMs, ...fetchOpts } = opts;
   const timeoutMs = resolveHeadersTimeout(headersTimeoutMs);
-  if (!sx || !useProxy || !sx.isProvisioned()) return directFetch(url, fetchOpts, timeoutMs);
-  return proxiedFetch(url, fetchOpts, sx, timeoutMs);
+  if (sx && useProxy && sx.isProvisioned()) return proxiedFetch(url, fetchOpts, sx, timeoutMs);
+  // The global-fetch escape hatch cannot speak CONNECT (that is why the tunnel
+  // is hand-rolled at all), so an upstream proxy overrides it rather than being
+  // silently dropped — on a host that needs the proxy, ignoring it means every
+  // request fails.
+  const useGlobal = USE_GLOBAL_FETCH && !proxyForHost(new URL(url).hostname);
+  return useGlobal ? directFetch(url, fetchOpts, timeoutMs) : pooledFetch(url, fetchOpts, timeoutMs);
 }
 
-// undici fetch (explicit parallel dispatcher — see UPSTREAM_AGENT) driven by our
-// own AbortController so we can arm a headers-only deadline and disarm it the
-// moment headers arrive (letting the body stream with no deadline).
-// AbortSignal.timeout can't do this — it would also kill the body.
+/**
+ * `fetch` for teamclaude's own control-plane calls — OAuth token exchange and
+ * refresh, profile, usage. Identical to global fetch when no upstream proxy is
+ * configured; tunneled through it when one is.
+ *
+ * These are not request-forwarding traffic, but they are the calls that decide
+ * whether an account can be added or kept alive at all. Leaving them direct
+ * would mean `login` fails and every token refresh dies on a host that can only
+ * reach the network through a proxy, which is precisely the reported setup.
+ */
+export function proxyFetch(url, opts = {}) {
+  const { headersTimeoutMs, ...rest } = opts;
+  if (!proxyForHost(new URL(url).hostname)) return fetch(url, rest);
+  return pooledFetch(url, rest, resolveHeadersTimeout(headersTimeoutMs));
+}
+
+// Default direct path: HTTP/1.1 over a pooled keep-alive agent, so N concurrent
+// requests use N connections instead of serializing over one h2 connection (#106).
+//
+// "Direct" here means "not via sx". A configured upstream proxy (config
+// `upstreamProxy`, or HTTPS_PROXY — see upstream-proxy.js) still applies: on
+// those hosts there is no such thing as a direct socket to api.anthropic.com,
+// which is the whole of issue #155.
+function pooledFetch(url, opts, timeoutMs) {
+  const u = new URL(url);
+  const isHttp = u.protocol === 'http:';
+  const port = Number(u.port) || (isHttp ? 80 : 443);
+  const proxy = proxyForHost(u.hostname);
+  if (proxy) {
+    const agent = proxyAgent(proxy, { targetHost: u.hostname, targetPort: port, tls: !isHttp, tlsOptions: opts.tlsOptions || {} });
+    return nodeRequest(u, opts, timeoutMs, { transport: isHttp ? http : https, agent });
+  }
+  return nodeRequest(u, opts, timeoutMs, { transport: isHttp ? http : https, agent: isHttp ? httpAgent : httpsAgent });
+}
+
+// Legacy direct path (escape hatch): Node global fetch, driven by our own
+// AbortController so we can arm a headers-only deadline and disarm it the moment
+// headers arrive (letting the body stream with no deadline). AbortSignal.timeout
+// can't do this — it would also kill the body.
 function directFetch(url, opts, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(headersTimeoutError(timeoutMs)), timeoutMs);
   timer.unref?.();
-  return undiciFetch(url, { ...opts, dispatcher: UPSTREAM_AGENT, signal: ctrl.signal }).then(
+  return fetch(url, { ...opts, signal: ctrl.signal }).then(
     (res) => { clearTimeout(timer); return res; },
     (err) => { clearTimeout(timer); throw err; },
   );
 }
 
+// sx path: every socket is a fresh TLS connection tunneled through sx.org. The
+// agent is created per request (its createConnection closes over this call's
+// target), so keep-alive would give no reuse — it would only park the tunneled
+// socket in a soon-orphaned pool and leak an open sx.org connection per request.
 function proxiedFetch(url, opts, sx, timeoutMs) {
   const u = new URL(url);
   const proxy = sx.getProxy();
-
-  // Custom agent: every socket is a TLS connection tunneled through sx.org. This
-  // agent is created per request (its createConnection closes over this call's
-  // target), so keep-alive would give no reuse — it would only park the tunneled
-  // socket in a soon-orphaned pool and leak an open sx.org connection per request.
   const agent = new https.Agent({ keepAlive: false });
   agent.createConnection = (_options, cb) => {
     // sx.tlsOptions is undefined in production (system CAs verify api.anthropic.com);
@@ -129,21 +159,37 @@ function proxiedFetch(url, opts, sx, timeoutMs) {
       .catch((err) => cb(err));
     return undefined; // socket delivered asynchronously via cb
   };
+  return nodeRequest(u, opts, timeoutMs, { transport: https, agent });
+}
 
+// Shared node:http(s) request → the fetch-Response subset server.js uses, with
+// the headers-only deadline: it fires before headers arrive and tears the request
+// down; it is cleared the instant the response starts, so a body that streams for
+// minutes is never cut. `req` is created BEFORE the timer so a synchronous
+// throw (e.g. an invalid client header) can't leave a scheduled timer that later
+// fires against an uninitialized binding.
+function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
   return new Promise((resolve, reject) => {
-    // Headers-only deadline (same as the direct path): fires before headers
-    // arrive and tears the tunneled request down; cleared once the response
-    // starts. `req` is created BEFORE the timer so a synchronous https.request
-    // throw (e.g. an invalid client header) can't leave a scheduled timer that
-    // fires later and dereferences an uninitialized binding.
-    const req = https.request(
+    const req = transport.request(
       u,
       { method: opts.method || 'GET', headers: opts.headers || {}, agent },
-      (res) => { clearTimeout(timer); resolve(makeResponse(res)); },
+      (res) => { clearTimeout(timer); cleanupAbort(); resolve(makeResponse(res)); },
     );
     const timer = setTimeout(() => req.destroy(headersTimeoutError(timeoutMs)), timeoutMs);
     timer.unref?.();
-    req.once('error', (err) => { clearTimeout(timer); reject(err); });
+
+    // Honour an AbortSignal the way fetch does. Callers that already guard a
+    // hung call this way (oauth's refresh timeout, which otherwise wedges every
+    // request for that account) must keep working when the call is tunneled.
+    const signal = opts.signal;
+    const onAbort = () => req.destroy(signal?.reason ?? new Error('aborted'));
+    const cleanupAbort = () => signal?.removeEventListener?.('abort', onAbort);
+    if (signal) {
+      if (signal.aborted) { clearTimeout(timer); req.destroy(); reject(signal.reason ?? new Error('aborted')); return; }
+      signal.addEventListener?.('abort', onAbort, { once: true });
+    }
+
+    req.once('error', (err) => { clearTimeout(timer); cleanupAbort(); reject(err); });
 
     const body = opts.body;
     const method = (opts.method || 'GET').toUpperCase();
@@ -153,9 +199,41 @@ function proxiedFetch(url, opts, sx, timeoutMs) {
   });
 }
 
+// Adapt a Node IncomingMessage to a web ReadableStream. Done by hand rather than
+// Readable.toWeb because that adapter double-closes the controller on Node 18
+// (ERR_INVALID_STATE "Controller is already closed" when the socket's 'close'
+// fires after 'end'), which crashes the process. The `closed` guard makes close
+// idempotent; backpressure via pause/resume so a slow consumer doesn't buffer the
+// whole (possibly minutes-long) stream in memory.
+function nodeToWeb(res) {
+  let closed = false;
+  const close = (controller) => {
+    if (closed) return;
+    closed = true;
+    try { controller.close(); } catch { /* already closed / consumer gone */ }
+  };
+  return new ReadableStream({
+    start(controller) {
+      res.on('data', (chunk) => {
+        try { controller.enqueue(chunk); } catch { return; }
+        if (controller.desiredSize != null && controller.desiredSize <= 0) res.pause();
+      });
+      res.on('end', () => close(controller));
+      res.on('close', () => close(controller));
+      res.on('error', (err) => {
+        if (closed) return;
+        closed = true;
+        try { controller.error(err); } catch { /* consumer gone */ }
+      });
+    },
+    pull() { res.resume(); },
+    cancel() { res.destroy(); },
+  });
+}
+
 // Wrap a Node IncomingMessage as the subset of a fetch Response that server.js uses.
 function makeResponse(res) {
-  const web = Readable.toWeb(res); // single web stream — one consumer either way
+  const web = nodeToWeb(res); // single web stream — one consumer either way
   const collect = async () => {
     const chunks = [];
     const reader = web.getReader();
@@ -168,8 +246,10 @@ function makeResponse(res) {
   };
   return {
     status: res.statusCode,
+    ok: res.statusCode >= 200 && res.statusCode < 300,
     headers: makeHeaders(res.headers),
     body: web,
+    async json() { return JSON.parse((await collect()).toString('utf8')); },
     async text() { return (await collect()).toString('utf8'); },
     async arrayBuffer() { const b = await collect(); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
   };

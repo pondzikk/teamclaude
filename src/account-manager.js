@@ -1,9 +1,16 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, isFableModel } from './model.js';
+import { SessionTracker } from './session-tracker.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
+
+// How long after a successful token refresh a forced (post-401) refresh is
+// suppressed. Long enough to cover the 401s from requests already in flight
+// when the token turned over, short enough that a genuinely bad new token
+// recovers on the next request rather than staying stuck.
+const FORCED_REFRESH_FLOOR_MS = 10_000;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -88,6 +95,10 @@ function makeAccount(acct, index) {
     // retry-after. Distinct from `throttled`/rateLimitedUntil: it does NOT
     // make the account unavailable, so selection never rotates away from it.
     pausedUntil: null,
+    // When this account's token was last successfully refreshed. Gates forced
+    // (post-401) refreshes so a burst of stale in-flight requests can't rotate
+    // the refresh-token family once per request — see ensureTokenFresh.
+    _lastRefreshAt: null,
   };
 }
 
@@ -108,13 +119,30 @@ function keyLess(a, b) {
   return false;
 }
 
+// A representative model for a route's own globs, used to report what that route
+// does right now (which accounts may serve it, and which one it would pick).
+// Taken from the route object rather than looked up by name, so two routes
+// sharing a name are still each described by their own globs.
+function sampleModelFor(route) {
+  return route.match[0].replace(/\*/g, '') || 'model';
+}
+
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp, affinity, reserveFableAccounts } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, affinity, reserveFableAccounts, distributeSessions = false, sessionTracker } = {}) {
+    // How long a just-minted token is trusted against a forced refresh.
+    this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
+    // Session awareness (issue #109). The tracker is always on (passive — it just
+    // observes the x-claude-code-session-id header for the status readout).
+    // `distributeSessions` gates the behavioural change: keep each session on its
+    // account for cache reuse, but spread NEW sessions across equal-priority
+    // accounts by load instead of funnelling them all onto the current one.
+    this.sessionTracker = sessionTracker || new SessionTracker();
+    this.distributeSessions = !!distributeSessions;
     // Ephemeral per-route manual pins (routeName → account index). Not persisted:
     // like the global manual switch (currentIndex) these are runtime overrides that
     // bias selection for a route's models and reset on restart. A pinned account
@@ -467,11 +495,20 @@ export class AccountManager {
    * satisfies both, selection degrades to executor-only routing so the main
    * request keeps flowing (upstream then fails just the advisor call).
    */
-  getActiveAccount(exclude = null, model = null, advisorModel = null) {
+  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     this.refreshExpiredQuotas();
+    // Session-affinity distribution (opt-in): keep a session on its pinned
+    // account for cache reuse, and route a new session to the least-loaded
+    // account. Only when enabled, only for a real session, and only outside a
+    // manual route pin (which must still win). Falls through to the normal walk
+    // if nothing session-eligible is found (e.g. the whole tier is exhausted).
+    if (this.distributeSessions && sessionId && !this._pinnedAccountForModel(model, advisorModel)) {
+      const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
+      if (acc) return acc;
+    }
     if (advisorModel) {
       const account = this._select(exclude, model, advisorModel, false);
       if (account) return account;
@@ -512,12 +549,9 @@ export class AccountManager {
       if (next) { current.requalify = false; return next; }
     }
     if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)) {
-      // A strictly higher-priority (lower value) available account preempts a
-      // healthy current one. Within the same priority tier we stay put, so the
-      // common case (all accounts at the default priority 0) is unchanged and
-      // never thrashes — preemption only triggers when priorities differ.
-      const betterExists = this.accounts.some(a =>
-        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
+      // Priority preemption via upstream's shared predicate, so _select and
+      // eligibility() can never drift apart on the answer.
+      const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
       // Fable-reserve on the sticky-current path: if `current` is one we want to
       // spare for Fable (still has Fable headroom, and this is a non-Fable
       // request) AND some non-reserved account can take this request, switch away
@@ -541,6 +575,82 @@ export class AccountManager {
     return allowProbe ? this._selectProbe(exclude, model) : null;
   }
 
+  /** Session-affinity selection (opt-in, issue #109). Honor a known session's
+   * pin when that account is still eligible and not preempted by a
+   * higher-priority one; otherwise route the session to the least-loaded
+   * eligible account. Returns null if nothing is eligible, so the caller falls
+   * back to the normal quota-driven walk. Does NOT record the pin — that happens
+   * on the actual route (recordSession), so retries/failover re-pin naturally. */
+  _selectForSession(sessionId, exclude, model, advisorModel) {
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId);
+    if (pinIdx != null) {
+      const pinned = this.accounts[pinIdx];
+      if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
+        // Mirror _select's priority preemption so an operator's priority order
+        // still wins over a session's stickiness.
+        const betterExists = this.accounts.some(a =>
+          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+        if (!betterExists) return pinned;
+      }
+    }
+    return this._pickLeastLoaded(exclude, model, advisorModel);
+  }
+
+  /** Best-available biased toward the fewest active sessions, so new sessions
+   * spread across equal-priority accounts instead of funnelling onto one. Order:
+   * priority → fewest active sessions → fewest in-flight → soonest weekly reset
+   * (the existing tiebreak). */
+  _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
+    const now = Date.now();
+    let best = null;
+    let bestPriority = Infinity;
+    let bestSessions = Infinity;
+    let bestInFlight = Infinity;
+    let bestReset = Infinity;
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index)) continue;
+      if (!this._isAvailable(account, model, advisorModel)) continue;
+      const priority = account.priority || 0;
+      const sessions = this.sessionTracker.activeCountFor(account.index, now);
+      const inFlight = account.inFlight || 0;
+      const reset = this._governingWeeklyReset(account, model) || -Infinity;
+      if (priority < bestPriority
+        || (priority === bestPriority && sessions < bestSessions)
+        || (priority === bestPriority && sessions === bestSessions && inFlight < bestInFlight)
+        || (priority === bestPriority && sessions === bestSessions && inFlight === bestInFlight && reset < bestReset)) {
+        best = account;
+        bestPriority = priority;
+        bestSessions = sessions;
+        bestInFlight = inFlight;
+        bestReset = reset;
+      }
+    }
+    return best;
+  }
+
+  /** Record that a session's request was served by an account (always on, even
+   * when distribution is off — the readout is passive). This is what pins a
+   * session for future affinity. */
+  recordSession(sessionId, accountIndex) {
+    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex);
+  }
+
+  /** Mark a session request as in flight / finished. Paired around the whole
+   * client request (including retries) so a long streaming completion keeps the
+   * session counted as active for its full duration. */
+  beginSession(sessionId) {
+    if (sessionId) this.sessionTracker.beginRequest(sessionId);
+  }
+
+  endSession(sessionId) {
+    if (sessionId) this.sessionTracker.endRequest(sessionId);
+  }
+
+  /** { known, active, perAccount } session counts for status/TUI. */
+  sessionStats() {
+    return this.sessionTracker.stats();
+  }
+
   /**
    * Like getActiveAccount, but if the selected account's OAuth token has ALREADY
    * expired it blocks on a refresh before returning — so a caller that injects
@@ -548,8 +658,8 @@ export class AccountManager {
    * 401. A token that is merely expiring soon (still valid) is left to the
    * caller's opportunistic background refresh; only a hard-expired one blocks.
    */
-  async getActiveAccountFresh(exclude = null, model = null, advisorModel = null) {
-    const account = this.getActiveAccount(exclude, model, advisorModel);
+  async getActiveAccountFresh(exclude = null, model = null, advisorModel = null, sessionId = null) {
+    const account = this.getActiveAccount(exclude, model, advisorModel, sessionId);
     if (account && account.type === 'oauth' && account.refreshToken
         && isTokenExpired(account.expiresAt)) {
       await this.ensureTokenFresh(account.index); // coalesces with any in-flight refresh
@@ -738,6 +848,51 @@ export class AccountManager {
   }
 
   /**
+   * The available account that would preempt `account` under the priority rule,
+   * or null. A strictly lower priority value wins; within the same tier we stay
+   * put, so the common case (every account at the default priority 0) never
+   * thrashes. Shared by _select, which enforces it, and eligibility(), which
+   * reports it — one predicate so the answer cannot drift from the behaviour.
+   */
+  _preemptedBy(account, model = null, advisorModel = null, exclude = null) {
+    return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
+      && !exclude?.has(a.index)
+      && (a.priority || 0) < (account.priority || 0)) || null;
+  }
+
+  /**
+   * Whether a request right now would actually route to an account, with a short
+   * reason when it would not. A caller that records a manual choice (the control
+   * plane's switch endpoint) needs to report whether that choice will take
+   * effect, not merely that it was stored: selection drops the choice on the very
+   * next request both when the account cannot serve traffic and when another
+   * available account outranks it on priority. Both are asked here through the
+   * same helpers _select uses, so the flag cannot promise more than the selector
+   * delivers.
+   * @returns {{eligible: boolean, reason?: string}}
+   */
+  eligibility(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return { eligible: false, reason: 'no such account' };
+    // _isAvailable also clears an expired throttle, so the specific reasons below
+    // are only consulted once it has actually said no.
+    if (!this._isAvailable(account)) {
+      if (account.disabled) return { eligible: false, reason: 'disabled' };
+      if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
+      if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
+      if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
+      return { eligible: false, reason: 'at or above the switch threshold' };
+    }
+    // Healthy, but a higher-priority account preempts it on the next selection.
+    // Phrased to read correctly after "<name> is ..." in the caller's message.
+    const preemptor = this._preemptedBy(account);
+    if (preemptor) {
+      return { eligible: false, reason: `outranked by higher-priority account "${preemptor.name}"` };
+    }
+    return { eligible: true };
+  }
+
+  /**
    * Normalize and store the configurable routing table. A route pins a set of
    * model globs to an exclusive set of accounts (and may override the governing
    * quota bucket). Called from the constructor and on config reload.
@@ -776,7 +931,7 @@ export class AccountManager {
   /** Whether `account` may serve `model`. A matching route with an `accounts`
    * list is exclusive (only listed accounts, by name or index). With no matching
    * route — or a route that lists no accounts — it falls back to the per-account
-   * `models` ownership claim so PR #74 configs keep working. */
+   * `models` ownership claim (deprecated — use `routes` instead). */
   _routeAllows(account, model) {
     const route = this._routeForModel(model);
     if (route && route.accounts.length) {
@@ -785,7 +940,8 @@ export class AccountManager {
     return this._accountOwnsModel(account, model);
   }
 
-  /** Returns true if no account claims model ownership, or this account does. */
+  /** @deprecated Use `routes` with an `accounts` list instead.
+   *  Returns true if no account claims model ownership, or this account does. */
   _accountOwnsModel(account, model) {
     for (const a of this.accounts) {
       if (a.models && a.models.some(m => modelMatches(m, model))) {
@@ -802,13 +958,16 @@ export class AccountManager {
    * own weekly bucket but no configured route already covers. Auto-created routes
    * carry `autocreated: true` and are never persisted — they simply surface the
    * per-model quota the server already respects. Each route lists the accounts it
-   * can use with a live eligibility flag.
+   * can use with a live eligibility flag, plus `target`: the one account it would
+   * pick right now. Everything here is derived for display and thrown away — the
+   * entries are fresh objects, never the stored (persisted) route definitions.
    */
   getRoutes() {
     const out = this.routes.map(r => ({
       name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
       pinned: this._pinnedName(r.name),
       accounts: this._routeAccountsView(r),
+      target: this._routeTarget(sampleModelFor(r)),
     }));
 
     const detected = [];
@@ -824,9 +983,17 @@ export class AccountManager {
         name: d.name, match: d.match, bucket: null, color: null, autocreated: true,
         pinned: this._pinnedName(d.name),
         accounts: this.accounts.map(a => ({ name: a.name, eligible: this._isAvailable(a, d.sample) })),
+        target: this._routeTarget(d.sample),
       });
     }
     return out;
+  }
+
+  /** The name of the account a request for `model` would land on right now, or
+   * null when nothing can serve it (every candidate disabled, spent or excluded). */
+  _routeTarget(model) {
+    const idx = this.previewRouteIndex(model);
+    return idx == null ? null : (this.accounts[idx]?.name ?? null);
   }
 
   /** The name of the account this route is manually pinned to, or null. */
@@ -838,7 +1005,7 @@ export class AccountManager {
   /** Accounts a configured route can use (all accounts when it lists none), each
    * with a live eligibility flag for a representative model of the route. */
   _routeAccountsView(route) {
-    const sample = route.match[0].replace(/\*/g, '') || 'model';
+    const sample = sampleModelFor(route);
     const inRoute = a => !route.accounts.length
       || route.accounts.includes(a.name) || route.accounts.includes(String(a.index));
     return this.accounts.filter(inRoute).map(a => ({ name: a.name, eligible: this._isAvailable(a, sample) }));
@@ -1339,6 +1506,21 @@ export class AccountManager {
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
+    // A forced refresh answers a 401, but 401s arrive in bursts: every request
+    // already in flight when the token went bad comes back rejected, and each
+    // one would force its own refresh. Coalescing only covers refreshes that
+    // OVERLAP — these arrive staggered, so they would rotate the refresh-token
+    // family once per request and make the proxy the very "other holder
+    // rotating the family" that causes this failure in the first place. A 401
+    // for a token minted moments ago is stale news from a request sent before
+    // the refresh landed, so trust the new token and let the caller retry with
+    // it. Only an expiry-driven refresh (force=false) bypasses this — it isn't
+    // reacting to a response and can't stampede.
+    if (force && account._lastRefreshAt !== null
+        && Date.now() - account._lastRefreshAt < this._forcedRefreshFloorMs) {
+      return;
+    }
+
     // Coalesce concurrent refreshes
     if (account._refreshPromise) return account._refreshPromise;
 
@@ -1350,6 +1532,7 @@ export class AccountManager {
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         account._deadRefreshToken = null; // this token works; clear any stale guard
+        account._lastRefreshAt = Date.now();
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
@@ -1477,6 +1660,7 @@ export class AccountManager {
    */
   getStatus() {
     this._sweepSessions(); // report live bindings, not expired ones
+    const sessions = this.sessionTracker.stats();
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
@@ -1488,6 +1672,7 @@ export class AccountManager {
         activeSessions: this.sessions.size,
       },
       routes: this.getRoutes(),
+      sessions: { ...sessions, distribute: this.distributeSessions },
       accounts: this.accounts.map(a => ({
         name: a.name,
         sessions: this._sessionCount(a.index),
@@ -1496,6 +1681,11 @@ export class AccountManager {
         priority: a.priority || 0,
         disabled: a.disabled || false,
         status: a.status,
+        // NOTE: `sessions` above is OURS (affinity bindings, drives placement and
+        // tcq's `ses` column). Upstream also emitted `sessions:
+        // sessions.perAccount[a.index]` here — a SECOND key of the same name in
+        // this literal, which is valid JS where the last one silently wins. Its
+        // per-account numbers remain available under `sessions.perAccount`.
         quota: { ...a.quota },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil

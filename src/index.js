@@ -2,20 +2,28 @@
 
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { createWriteStream } from 'node:fs';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { sameIdentity, orgKey, matchAccounts } from './identity.js';
+import { sameIdentity, orgKey, matchAccounts, findUpsertTarget } from './identity.js';
+import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
 import { TUI } from './tui.js';
+import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
+import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
+import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
+import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
+import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -43,8 +51,16 @@ switch (command) {
     await statusCommand();
     process.exit(0);
     break;
+  case 'attach':
+    await attachCommand();
+    process.exit(0);
+    break;
   case 'accounts':
     await accountsCommand();
+    process.exit(0);
+    break;
+  case 'switch':
+    await switchCommand();
     process.exit(0);
     break;
   case 'remove':
@@ -69,6 +85,10 @@ switch (command) {
     break;
   case 'alias':
     aliasCommand();
+    process.exit(0);
+    break;
+  case 'service':
+    await serviceCommand();
     process.exit(0);
     break;
   case 'probe':
@@ -113,11 +133,21 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  // Installed first: the server is the long-lived process, it runs under a TUI
+  // that repaints over anything Node prints on the way out, and a crash here
+  // takes every routed session with it. Without this, a proxy that vanished
+  // overnight leaves nothing behind to explain why.
+  const crashLog = getCrashLogPath();
+  installCrashHandlers(crashLog);
+
   const config = await loadOrCreateConfig();
 
   // --log-to <dir>
   const logTo = argValue('--log-to');
   if (logTo) config.logDir = logTo;
+
+  // --activity-log <file>
+  const activityLogPath = argValue('--activity-log') || null;
 
   if (config.accounts.length === 0) {
     console.error('No accounts configured.\n');
@@ -134,8 +164,33 @@ async function serverCommand() {
     process.exit(1);
   }
 
+  // `accounts[].models` (#74) is superseded by the `routes` table (#86). Routes
+  // do the same job with glob matching, several accounts per rule and a bucket
+  // override — and, unlike `models`, they don't silently change eligibility
+  // fleet-wide the moment one account declares a list (see _accountOwnsModel).
+  // Behaviour is unchanged; this only tells pre-#86 configs what to migrate to
+  // before the field goes away. Reported against config.accounts so the notice
+  // names what is actually written on disk, whatever resolution does with it.
+  for (const acct of config.accounts) {
+    if (!acct.models?.length) continue;
+    const route = { name: acct.name, match: acct.models, accounts: [acct.name] };
+    console.error(`[TeamClaude] Deprecated: account "${acct.name}" uses "models" — replace it with a routes entry: ${JSON.stringify(route)}`);
+  }
+
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, affinity: config.sessionAffinity, reserveFableAccounts: config.reserveFableAccounts });
+  const accountManager = new AccountManager(accounts, threshold, {
+    routes: config.routes,
+    ramp: config.stormRamp,
+    affinity: config.sessionAffinity,
+    reserveFableAccounts: config.reserveFableAccounts,
+    // Hard-coded off, deliberately NOT read from config. Upstream's session
+    // distribution makes priority a hard first key, so on a fleet whose
+    // priorities are all distinct it funnels every session onto the best one
+    // (measured: 30/30 sessions on one account) — the exact regime 613fb0a
+    // fixed. Session affinity owns selection here; a config flag flipping this
+    // on would silently preempt it.
+    distributeSessions: false,
+  });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
@@ -252,7 +307,7 @@ async function serverCommand() {
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config, sx,
+      accountManager, config, sx, activityLogPath,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
@@ -294,9 +349,51 @@ async function serverCommand() {
     };
   }
 
+  // In headless mode, wire activity-log writes directly via hooks + console.
+  if (!tui && activityLogPath) {
+    const aStream = createWriteStream(activityLogPath, { flags: 'a' });
+    aStream.on('error', err => process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`));
+    const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+    const writeActivity = msg => {
+      // Strip [TeamClaude] prefix to match TUI behaviour
+      aStream.write(`${ts()}  ${msg.replace(/^\[TeamClaude\]\s*/, '')}\n`);
+    };
+    // Capture request completions via the hook
+    const inFlight = new Map();
+    hooks.onRequestStart = (id, info) => inFlight.set(id, { ...info, started: Date.now() });
+    hooks.onRequestModel = (id, info) => {
+      const r = inFlight.get(id);
+      if (r && info.model) r.model = info.model;
+    };
+    hooks.onRequestRouted = (id, info) => {
+      const r = inFlight.get(id);
+      if (r) r.account = info.account;
+    };
+    hooks.onRequestEnd = (id, info) => {
+      const r = inFlight.get(id);
+      inFlight.delete(id);
+      const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
+      const acct = info.account || r?.account || '?';
+      const model = info.model ? ` (${info.model})` : '';
+      const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
+      const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
+      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    };
+    // Tee console output to the activity log as well
+    const origLog = console.log;
+    const origErr = console.error;
+    console.log = (...a) => { const m = a.join(' '); origLog(m); writeActivity(m); };
+    console.error = (...a) => { const m = a.join(' '); origErr(m); writeActivity(m); };
+    process.on('exit', () => aStream.end());
+  }
+
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
   hooks.getStatusExtra = () => ({
+    // Read live from the shared config (not a startup snapshot) so the TUI's
+    // blocklist editor shows up in `status` immediately, the same way the
+    // per-request gate in server.js picks it up.
+    blockedModels: [...(config.blockedModels || [])],
     server: {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
@@ -343,6 +440,14 @@ async function serverCommand() {
     // benign runtime handler so a later 'error' is logged rather than thrown.
     server.removeListener('error', onListenError);
     server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
+    // Announce an egress proxy, especially one inherited from the environment:
+    // it changes where every upstream byte goes, and a value nobody typed here
+    // should never be in force silently.
+    const egressProxy = getUpstreamProxy();
+    if (egressProxy.proxy) {
+      const via = egressProxy.source.startsWith('env:') ? ` (from ${egressProxy.source.slice(4)})` : '';
+      console.log(`[TeamClaude] Upstream proxy: ${describeProxy(egressProxy.proxy)}${via}`);
+    }
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
@@ -367,6 +472,10 @@ async function serverCommand() {
       console.log('');
     }
   });
+
+  // Reflect the active account in the terminal title so a backgrounded/tabbed
+  // server is glanceable. Works in both TUI and headless modes.
+  const stopTitle = startTerminalTitleUpdater(accountManager);
 
   // Persist quota every minute; unref so it never keeps the process alive.
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
@@ -402,6 +511,7 @@ async function serverCommand() {
     if (shuttingDown) process.exit(0); // second ctrl-c: stop waiting, just go
     shuttingDown = true;
     try { tui?.stop(); } catch { /* terminal already restored */ }
+    stopTitle();
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
@@ -541,10 +651,52 @@ async function loginOAuthCommand() {
 
 // ── env ─────────────────────────────────────────────────────
 
+// `teamclaude env [--no-mitm]` — print the export lines that point Claude Code
+// at the proxy, for `eval "$(teamclaude env)"`. Mirrors `teamclaude run`'s
+// environment (MITM forward-proxy by default; --no-mitm for base-URL only) so a
+// tool that spawns claude itself — an agent multiplexer, a CI job, a manual
+// shell — gets the same routing without going through `run`. Only the export
+// lines go to stdout; all guidance goes to stderr so the output stays eval-safe.
 async function envCommand() {
-  const config = await loadOrCreateConfig();
-  console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
-  console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
+  // Use loadConfig (not loadOrCreateConfig): a query command must never write to
+  // stdout — creating a config prints "Created config at …", which would poison
+  // `eval "$(teamclaude env)"` — nor silently create config as a side effect.
+  const config = await loadConfig();
+  if (!config) {
+    process.stderr.write(`No config found at ${getConfigPath()}. Add an account first: teamclaude login\n`);
+    process.exit(1);
+  }
+  const port = config.proxy.port;
+  const useMitm = !args.slice(1).includes('--no-mitm');
+
+  let caPath = null;
+  if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
+
+  // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
+  const account = (process.env.TC_ACCT || '').trim();
+  const lines = buildClaudeEnvLines({
+    port, useMitm, caPath, holdSeconds: config.holdSeconds,
+    account, proxyApiKey: config.proxy?.apiKey || '',
+  });
+  process.stdout.write(`${lines.join('\n')}\n`);
+
+  const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
+  process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
+  if (account) {
+    process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
+    // Warn, don't fail: the account list can change before the shell is used,
+    // and this command must stay eval-safe.
+    if (!(config.accounts || []).some((a, i) => a.name === account || String(i) === account)) {
+      process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
+    }
+  }
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
+  if (!(await isProxyUp(port))) {
+    process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
+  }
+  if (config.proxy?.apiKey) {
+    process.stderr.write(`# remote (non-loopback) clients must also present the proxy key: ANTHROPIC_API_KEY=<proxy.apiKey> (base-URL), or http://<key>@host:${port} (MITM)\n`);
+  }
 }
 
 // ── run ─────────────────────────────────────────────────────
@@ -572,6 +724,16 @@ async function runCommand() {
   // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
   const env = { ...process.env };
+  // TC_ACCT pins this session to one account, in either mode. It is teamclaude's
+  // own knob, so it never reaches the child: claude has no use for it, and an
+  // account name is not something to leak into a subprocess environment that
+  // gets inherited by every tool and MCP server claude spawns.
+  const tcAcct = (process.env.TC_ACCT || '').trim();
+  delete env.TC_ACCT;
+  // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
+  // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
+  // MITM mode too, and keeps the pin out of the API path.
+  const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
   if (await isProxyUp(port)) {
     if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
@@ -579,16 +741,37 @@ async function runCommand() {
       // real token injected. claude trusts our MITM leaf via NODE_EXTRA_CA_CERTS.
       const host = upstreamHost(config);
       const { caPath } = await ensureCerts(host);
-      const proxyUrl = `http://127.0.0.1:${port}`;
+      // The pin rides in the proxy URL's userinfo, which the client forwards as
+      // `Proxy-Authorization: Basic <acct>:<key>` on each CONNECT — the only pin
+      // channel an HTTPS_PROXY env var can express. The password slot keeps the
+      // proxy apiKey, matching the existing `--proxy http://<key>@host:port`
+      // form, so auth and pinning coexist in one URL.
+      const userinfo = tcAcct
+        ? `${encodePinComponent(tcAcct)}:${encodePinComponent(config.proxy?.apiKey || '')}@`
+        : '';
+      const proxyUrl = `http://${userinfo}127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
       env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
       env.NODE_EXTRA_CA_CERTS = caPath;
+      if (tcAcct) console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
+      else if (pinnedBase) {
+        console.error('[TeamClaude] Account pin in ANTHROPIC_BASE_URL ignored: MITM mode does not use a base URL.');
+        console.error('[TeamClaude] Use TC_ACCT=<account> instead — it pins in both modes.');
+      }
       delete env.ANTHROPIC_BASE_URL;
     } else {
       // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
       // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
       // lets Claude Code stay in subscription mode (full model access).
-      env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      // TC_ACCT wins; teamclaude builds the pinned URL itself rather than making
+      // the caller hand-write one. Otherwise an existing /tc-acct/ base URL
+      // pointing at this proxy is preserved for configs written against 1.1.10.
+      if (tcAcct) {
+        env.ANTHROPIC_BASE_URL = `http://localhost:${port}/tc-acct/${encodePinComponent(tcAcct)}`;
+        console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
+      } else if (!pinnedBase) {
+        env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      }
     }
   } else if (autoFallback) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
@@ -597,6 +780,19 @@ async function runCommand() {
     console.error('Start it with: teamclaude server');
     console.error('Or pass --auto-fallback to launch claude directly (bypassing the proxy) when it is down.');
     process.exit(1);
+  }
+
+  // If holdSeconds is set, ensure API_TIMEOUT_MS on the Claude Code side is
+  // large enough for the hold to complete. Add 60s padding (one extra poll
+  // cycle) so the client doesn't time out while we're still waiting.
+  // Claude Code defaults API_TIMEOUT_MS to 600000ms (10 min) when unset, so
+  // use that as the baseline to avoid accidentally lowering the timeout.
+  const holdMs = (config.holdSeconds || 0) * 1000;
+  if (holdMs > 0) {
+    const needed = holdMs + 60_000;
+    const API_TIMEOUT_DEFAULT_MS = 600_000;
+    const current = parseInt(env.API_TIMEOUT_MS || '0', 10) || API_TIMEOUT_DEFAULT_MS;
+    if (current < needed) env.API_TIMEOUT_MS = String(needed);
   }
 
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
@@ -643,6 +839,122 @@ async function statusCommand() {
     console.log(renderStatus(data, { color }));
   } catch (err) {
     console.error('Cannot connect to proxy at localhost:' + config.proxy.port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── attach ──────────────────────────────────────────────────
+
+// The interactive dashboard against a server that is ALREADY running. A proxy
+// installed as a background service has no foreground TUI, so this is the only
+// way to watch and steer it live; it renders from polled status and can only do
+// what the control plane exposes (switch, reload).
+async function attachCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  // Reach the server where it actually binds (see serverCommand): a host set in
+  // the config or the environment is not reachable as localhost, and reporting
+  // "not running" for a server that is plainly up is the worst of the answers.
+  // A wildcard bind is not an address to dial, so dial this machine instead.
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+
+  // Checked before connecting: the dashboard needs raw-mode input, and failing
+  // on that after a successful poll would be a confusing order to report it in.
+  if (!process.stdin.isTTY) {
+    console.error('teamclaude attach needs a terminal. For a one-shot readout use: teamclaude status');
+    process.exit(1);
+  }
+
+  const control = new RemoteControl({ port, host, apiKey: config.proxy.apiKey });
+  let first;
+  try {
+    first = await control.status(); // fail here, with a usable message, not inside the TUI
+  } catch (err) {
+    console.error(`Cannot connect to proxy at ${host}:${port}`);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+
+  await new Promise(resolve => {
+    const session = createAttachSession({ control, config, onQuit: resolve });
+    // The status just fetched is the first frame: without it the alt-screen opens
+    // on a disconnected, empty dashboard until the first poll lands.
+    session.am.applyStatus(first);
+    session.start();
+  });
+}
+
+// ── switch ──────────────────────────────────────────────────
+
+// Manual account switch against a RUNNING server — the headless equivalent of
+// pressing 's' in the TUI, which is unreachable when the proxy runs as a
+// background service. Nothing is written to the config: like the TUI's switch
+// this is a runtime preference that dies with the process, so the server is the
+// only place that can answer or apply it.
+async function switchCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const headers = { 'x-api-key': config.proxy.apiKey };
+  const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
+
+  try {
+    if (!name) {
+      const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers });
+      // Something answered on the port. Whether it is our proxy is a separate
+      // question, and getting it wrong would blame a down server for a reply we
+      // simply could not read — or report an unreadable reply as an empty fleet.
+      const data = res.ok ? await res.json().catch(() => null) : null;
+      if (!data || !Array.isArray(data.accounts)) {
+        console.error(`Unexpected reply from localhost:${port} (HTTP ${res.status}) — no account list in it.`);
+        console.error('Something is listening there, but it does not answer like this teamclaude version.');
+        process.exit(1);
+      }
+      if (!data.accounts.length) {
+        console.log('No accounts configured.');
+        return;
+      }
+      for (const a of data.accounts) {
+        // Flag what would stop traffic reaching an account. The TUI shows this in
+        // its table, so leaving it out here would make the headless half of the
+        // feature the only place a disabled account looks switchable.
+        const state = a.disabled ? 'disabled' : (a.status && a.status !== 'active' ? a.status : null);
+        console.log(`${a.name === data.currentAccount ? '*' : ' '} ${a.name}${state ? `  (${state})` : ''}`);
+      }
+      console.log('\nSwitch with: teamclaude switch <name>');
+      return;
+    }
+
+    const res = await fetch(`http://localhost:${port}/teamclaude/switch`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      // Our own errors are strings. A server too old to know this endpoint
+      // forwards the request upstream instead, and Anthropic's error is an
+      // object — printing that raw gives the user "[object Object]".
+      const detail = typeof data.error === 'string' ? data.error : null;
+      console.error(detail || `Switch failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+      if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+      if (data.accounts?.length) {
+        console.error('Known accounts:');
+        for (const n of data.accounts) console.error(`  ${n}`);
+      }
+      process.exit(1);
+    }
+    console.log(`Switched to "${data.account}"`);
+    // Recorded is not the same as in effect: rotation skips an account it cannot
+    // use on the very next request, so saying nothing here would be a quiet lie.
+    if (data.eligible === false) {
+      console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, so requests will not route to it until that changes.`);
+    }
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
     console.error('Is the server running? Start with: teamclaude server');
     if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
@@ -746,6 +1058,8 @@ async function accountsCommand() {
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
     if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
+    // The stable pin identity (TC_ACCT), unlike the display name above.
+    if (a.accountUuid) console.log(`       ID:    ${a.accountUuid}`);
     if (verbose && a.expiresAt) {
       const remaining = a.expiresAt - Date.now();
       if (remaining <= 0) {
@@ -830,6 +1144,50 @@ function aliasCommand() {
     alias.installAlias({ shell });
   } else {
     alias.printAlias({ shell });
+  }
+}
+
+// ── service ─────────────────────────────────────────────────
+
+async function serviceCommand() {
+  const sub = args[1] || 'status';
+  const kind = serviceKind();
+  if (!kind) {
+    console.error(`teamclaude service: no service integration for ${process.platform}`);
+    console.error('Run the proxy yourself with: teamclaude server --headless');
+    process.exit(1);
+  }
+  // Carry an explicit config path into the unit: a service started by launchd or
+  // systemd does not inherit the shell's TEAMCLAUDE_CONFIG, so a non-default
+  // config would silently be ignored and the service would serve a different
+  // (or empty) account list than the CLI does.
+  const configPath = process.env.TEAMCLAUDE_CONFIG || null;
+
+  switch (sub) {
+    case 'install': {
+      const res = await installService({ configPath });
+      if (!res.ok) { console.error(`teamclaude service install failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'uninstall': {
+      const res = await uninstallService();
+      if (!res.ok) { console.error(`teamclaude service uninstall failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'print':
+      process.stdout.write(renderService({ configPath }));
+      break;
+    case 'status': {
+      const s = await serviceStatus();
+      console.log(`Service:   ${s.installed ? s.file : 'not installed'}`);
+      console.log(`State:     ${s.running ? `running${s.pid ? ` (pid ${s.pid})` : ''}` : s.detail}`);
+      if (kind === 'launchd') console.log(`Logs:      ${logPath()}`);
+      else console.log('Logs:      journalctl --user --unit teamclaude.service');
+      break;
+    }
+    default:
+      console.error('Usage: teamclaude service <install|uninstall|status|print>');
+      process.exit(1);
   }
 }
 
@@ -1143,18 +1501,30 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
-  env                 Print env vars to use with Claude
+  env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
+                      'eval "$(teamclaude env)"' (MITM forward-proxy by default;
+                      --no-mitm for base-URL only). Handy for agent multiplexers
+                      that spawn claude themselves instead of via 'teamclaude run'
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
                       Routes via an HTTPS forward proxy + local CA by default, so
                       even hardcoded api.anthropic.com endpoints are intercepted;
-                      --no-mitm uses base-URL routing only
+                      --no-mitm uses base-URL routing only. Set TC_ACCT to pin
+                      the session to one account (see Environment below)
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
+  service <sub>       Run the proxy as a user service that starts at login and
+                      restarts on its own: install | uninstall | status | print
+                      (LaunchAgent on macOS, systemd --user unit on Linux;
+                      'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  attach              Open the live dashboard against a running server; s
+                      switches account, R reloads config, q leaves it running
   accounts            List configured accounts
+  switch [NAME]       Make the running server prefer one account (as 's' in the
+                      TUI does); with no NAME, list accounts and mark the current
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
@@ -1174,26 +1544,62 @@ Commands:
 Options:
   --name NAME         Set account name (import/login)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
-  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json)
+  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
+                      on macOS the default falls back to the Keychain)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
+  --activity-log FILE Append TUI activity lines to FILE (server; works in headless mode too)
   --headless          Run the server without the interactive TUI (for backgrounding)
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
   --auto-fallback     (run) if the proxy is down, launch claude directly instead
                       of erroring out (bypasses the proxy: no rotation)
+
+Environment:
+  TC_ACCT             Pin a session to ONE account, bypassing rotation. Works in
+                      both modes. Accepts accountUuid, orgUuid,
+                      accountUuid/orgUuid, or a display name/email:
+                        TC_ACCT=me@example.com teamclaude run
+                      Prefer a UUID for anything scripted: display names are
+                      rewritten when an email gains a second org. Read by 'run'
+                      and 'env', then removed from the environment so it never
+                      reaches claude or the tools it spawns. An unknown account
+                      is refused rather than silently rotated.
+  TEAMCLAUDE_CONFIG   Path to the config file (default below)
+  TEAMCLAUDE_DISABLE_AUTOUPDATE=1
+                      Skip the background self-update check
 
 The server always accepts both base-URL and proxy/CONNECT clients, so instances
 launched with and without --no-mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
+POST /teamclaude/switch {"account": "<name>"} makes one account the preferred
+one, which is what 'teamclaude switch' calls.
+
+Upstream proxy. On a host with no direct route to the internet, set
+"upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every
+outbound connection — request forwarding, OAuth login, token refresh, profile
+and usage — is CONNECT-tunneled through it, TLS end to end. HTTPS_PROXY /
+ALL_PROXY are honored when the config says nothing, NO_PROXY exempts hosts, and
+"upstreamProxy": false ignores the environment entirely. Settable live in the
+TUI settings screen. Distinct from "proxy" (the local port Claude Code talks to)
+and from sx.org (a specific residential-egress provider with its own policy).
+
+Egress pin (opt-in, off unless configured). Set "egress": { "pin": "auto" } to
+hold requests whenever the exit IP is not the pinned one — a VPN that dropped
+mid-session otherwise sends the request from an unexpected region, and upstream
+answers 403, which Claude Code reports as a dead session and demands a re-login.
+"auto" pins whatever address the server sees first; an explicit IP (or a list of
+them) pins those. Held requests wait up to holdSeconds (default 120), then get a
+503. See config.example.json.
 
 A global npm install self-updates in the background (checked once/day, applied
 on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
 "autoUpdate": false in the config.
 
 Config: ${getConfigPath()}
+Crash log: ${getCrashLogPath()} (server; written when the process dies unexpectedly)
 `);
 }
 
@@ -1236,9 +1642,9 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   };
 
   // Deduplicate by account+org identity (same email in a different org is a
-  // distinct account), then by name.
-  let idx = config.accounts.findIndex(a => sameIdentity(a, account));
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
+  // distinct account), then by name — but only where the name is not standing in
+  // for a different account+org, which is exactly the multi-org case below.
+  const idx = findUpsertTarget(config.accounts, account);
 
   if (idx >= 0) {
     // Same account+org: refresh credentials and org info, but keep the existing
@@ -1364,28 +1770,19 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 
 // ── helpers ─────────────────────────────────────────────────
 
-async function resolveAccounts(config) {
-  const accounts = [];
-  for (const acct of config.accounts) {
-    if (acct.type === 'oauth') {
-      if (acct.importFrom) {
-        try {
-          const creds = await importCredentials(acct.importFrom);
-          accounts.push({ name: acct.name, type: 'oauth', ...creds });
-          console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
-        } catch (err) {
-          console.error(`Failed to import "${acct.name}": ${err.message}`);
-        }
-      } else if (acct.accessToken) {
-        accounts.push(acct);
-      } else {
-        console.error(`No token for "${acct.name}", skipping`);
-      }
-    } else if (acct.type === 'apikey' && acct.apiKey) {
-      accounts.push(acct);
-    }
-  }
-  return accounts;
+// Is `url` a /tc-acct/<name> account pin aimed at OUR proxy? Parsed rather than
+// prefix-matched so every local spelling counts (localhost, 127.0.0.1, [::1]),
+// while a pin URL for a different host/port is not ours to honour.
+function isLocalAccountPin(url, port) {
+  if (!url) return false;
+  let u;
+  try { u = new URL(url); } catch { return false; }
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  // An omitted port means the scheme default, which still matches a proxy that
+  // happens to run on 80/443.
+  const urlPort = u.port || (u.protocol === 'https:' ? '443' : '80');
+  return isLocal && urlPort === String(port) && u.pathname.startsWith('/tc-acct/');
 }
 
 function argValue(flag) {
@@ -1397,6 +1794,41 @@ function argValue(flag) {
 function upstreamHost(config) {
   try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
   catch { return 'api.anthropic.com'; }
+}
+
+// Keep the terminal title in sync with the active account (e.g. "teamclaude 2/4
+// work") so a backgrounded or tabbed `teamclaude server` is glanceable. TTY-only
+// — never emit escapes into a pipe, a `--log-to` redirect, or a systemd journal;
+// opt out entirely with TEAMCLAUDE_NO_TITLE. Polls (rather than hooking every
+// currentIndex mutation) and writes only when the title actually changes.
+// Returns an idempotent stop() that restores the shell's previous title.
+function startTerminalTitleUpdater(accountManager) {
+  const out = process.stdout;
+  if (!out.isTTY || process.env.TEAMCLAUDE_NO_TITLE) return () => {};
+
+  let last = null;
+  const render = () => {
+    const total = accountManager.accounts.length;
+    const index = Math.min(accountManager.currentIndex || 0, Math.max(0, total - 1));
+    const name = accountManager.accounts[index]?.name || null;
+    const title = formatTerminalTitle({ index, total, name });
+    if (title !== last) { last = title; out.write(titleSequence(title)); }
+  };
+
+  out.write(TITLE_STACK_PUSH); // save whatever title the shell had
+  render();
+  const timer = setInterval(render, 2000);
+  timer.unref?.();
+
+  let stopped = false;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    try { out.write(TITLE_STACK_POP); } catch { /* terminal gone */ }
+  };
+  process.on('exit', stop); // backstop for exits that bypass shutdown()
+  return stop;
 }
 
 // Best-effort: tell a running server (if any) to re-sync accounts from config so

@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr } from './server.js';
+import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr, relayUpgrade, resolveAccountPin } from './server.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -110,32 +110,50 @@ export function hostMode(host, config) {
  * the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx });
+  const holdMs = (config.holdSeconds || 0) * 1000;
 
-  // One terminating h2/h1 server, minted lazily on the first intercepted CONNECT.
+  // One terminating h2/h1 server per pin, minted lazily on the first intercepted
+  // CONNECT that needs it (key '' = unpinned, the common case).
   // TLS uses our leaf; ALPN negotiates h2 or http/1.1 (allowHTTP1) with whatever
   // the client offers. It emits 'request' for BOTH protocols, so `forward` — the
   // shared buffering/retrying proxy listener — handles them identically. Each
   // CONNECT feeds it the raw tunnel socket; the client keeps the tunnel open and
   // multiplexes many requests over it, each independently account-selected.
-  let serverPromise = null;
-  const getServer = () => (serverPromise ||= (async () => {
+  //
+  // Keying by pin is what carries a TC_ACCT pin from the CONNECT to the requests
+  // inside the tunnel. The alternative — tagging the raw socket and reading it
+  // back from the request — means digging through a TLSSocket and, under h2, a
+  // Proxy over the session socket. A listener bound to the account is the same
+  // information with none of that. The map is bounded by the account count.
+  const serverPromises = new Map();
+  const getServer = (pin = '') => {
+    let p = serverPromises.get(pin);
+    if (p) return p;
+    p = (async () => {
     const { key, cert } = await ensureLeaf();
     const srv = http2.createSecureServer({ key, cert, allowHTTP1: true });
-    srv.on('request', forward);
+    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress }));
+    // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
+    // which never fires 'request' — only 'upgrade', with a raw socket instead
+    // of a response object (h1-only; falls back to blind h2 passthrough is not
+    // needed since WS clients negotiate h1 for the handshake).
+    srv.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
     srv.on('sessionError', (e) => log(`[TeamClaude] MITM session error: ${e.message}`));
     srv.on('clientError', (e, sock) => { try { sock.destroy(); } catch { /* already gone */ } });
     return srv;
-  })().catch((err) => {
-    // Don't let a transient cert/disk failure poison the memo forever: reset it
-    // so the next intercepted CONNECT retries instead of re-awaiting a cached
-    // rejection (which would leave the MITM path dead until a restart).
-    serverPromise = null;
-    throw err;
-  }));
+    })().catch((err) => {
+      // Don't let a transient cert/disk failure poison the memo forever: drop it
+      // so the next intercepted CONNECT retries instead of re-awaiting a cached
+      // rejection (which would leave the MITM path dead until a restart).
+      serverPromises.delete(pin);
+      throw err;
+    });
+    serverPromises.set(pin, p);
+    return p;
+  };
 
   return (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
@@ -209,12 +227,63 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // server can't be minted (cert/disk/TLS-init failure) we haven't replied yet
     // — send a 502 so the client sees a real proxy error instead of "Proxy
     // connection ended before receiving CONNECT response".
-    getServer().then((srv) => {
+    // Pin resolution is deliberately confined to `rewrite`. Clients send
+    // Proxy-Authorization on EVERY CONNECT, including blind-tunneled third-party
+    // hosts, where an account pin is meaningless — rejecting there would take
+    // down unrelated traffic over a typo meant for Anthropic.
+    const { pin, error } = resolveConnectPin(req, accountManager, proxyApiKey);
+    if (error) {
+      log(`[TeamClaude] CONNECT ${host}: ${error}`);
+      try {
+        clientSocket.write(`HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="teamclaude"\r\nConnection: close\r\n\r\n`);
+      } catch { /* client already gone */ }
+      clientSocket.destroy();
+      return;
+    }
+
+    getServer(pin || '').then((srv) => {
       reply200Raw(clientSocket);
       if (head && head.length) clientSocket.unshift(head);
       srv.emit('connection', clientSocket);
     }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
   };
+}
+
+// The Basic username from a CONNECT's `Proxy-Authorization`, or null. This is
+// the only pin channel expressible in an HTTPS_PROXY URL, which is what
+// `teamclaude run` has to work with in MITM mode (there is no request path to
+// carry a `/tc-acct/` prefix — inside the tunnel the path is the real upstream
+// one). Clients send this preemptively on every CONNECT.
+export function connectPinToken(req) {
+  const header = (req?.headers?.['proxy-authorization'] || '').trim();
+  if (!header.toLowerCase().startsWith('basic ')) return null;
+  const dec = Buffer.from(header.slice('basic '.length).trim(), 'base64').toString('utf8'); // "user:pass"
+  const colon = dec.indexOf(':');
+  return (colon >= 0 ? dec.slice(0, colon) : dec) || null;
+}
+
+/**
+ * Resolve the account pin on a CONNECT, or a rejection reason.
+ *
+ * The username slot is overloaded: the documented remote form is
+ * `--proxy http://<key>@host:port`, where it holds the proxy apiKey, not an
+ * account. So the key wins over any account of the same name — an operator who
+ * names an account after their proxy key gets auth, not a surprise pin.
+ *
+ * An unrecognized username is an ERROR rather than a silently ignored pin: a
+ * typo'd account name that quietly served from the wrong account is exactly the
+ * failure mode this feature exists to remove.
+ *
+ * @returns {{pin: string|null, error: string|null}}
+ */
+export function resolveConnectPin(req, accountManager, proxyApiKey) {
+  const token = connectPinToken(req);
+  if (!token) return { pin: null, error: null };
+  if (proxyApiKey && safeKeyEqual(token, proxyApiKey)) return { pin: null, error: null };
+  if (resolveAccountPin(accountManager, token) == null) {
+    return { pin: null, error: `Unknown account pin "${token}"` };
+  }
+  return { pin: token, error: null };
 }
 
 // Authorize a CONNECT: no key configured → open (matches the HTTP path); a

@@ -35,6 +35,20 @@ test('renderStatus prints core status', () => {
   assert.match(output, /2 req, 1.5k tok/);
 });
 
+test('renderStatus shows the sessions line and per-account session count when present', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true };
+  status.accounts[0].sessions = 2;
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · distributing/);
+  assert.match(output, /a \(oauth, prio 0\).*2 sess/);
+});
+
+test('renderStatus omits the sessions line when the status has no sessions field', () => {
+  const output = renderStatus(sampleStatus(), { color: false, now });
+  assert.doesNotMatch(output, /Sessions\s/);
+});
+
 test('renderStatus colors active accounts and bars', () => {
   const output = renderStatus(sampleStatus(), { color: true, now });
 
@@ -111,4 +125,77 @@ test('renderStatus sanitizes probe errors', () => {
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /bad red/);
   assert.doesNotMatch(output, /\x1b\[31m/);
+});
+
+// --- blocklist visibility (issue: a blocked model read as available) ---------
+// `Models` reports quota headroom, so a fully-blocked family used to render ✓
+// while every request for it got a 400. Quota and the blocklist are separate
+// gates; status has to surface both.
+
+function blockedStatus(blockedModels) {
+  const status = sampleStatus();
+  status.blockedModels = blockedModels;
+  status.accounts[0].quota = {
+    unified5h: 0.02,
+    unified5hReset: now + 3600_000,
+    unified7d: 0.49,
+    unified7dReset: now + 86_400_000,
+    unified7dFable: 0.11,
+    unified7dFableReset: now + 86_400_000,
+  };
+  return status;
+}
+
+test('renderStatus shows a Blocked row listing the configured patterns', () => {
+  const output = renderStatus(blockedStatus(['*fable*']), { color: false, now });
+  assert.match(output, /Blocked\s+\*fable\*/);
+});
+
+test('renderStatus omits the Blocked row when nothing is blocked', () => {
+  assert.doesNotMatch(renderStatus(blockedStatus([]), { color: false, now }), /Blocked/);
+  assert.doesNotMatch(renderStatus(sampleStatus(), { color: false, now }), /Blocked/);
+});
+
+test('renderStatus marks a blocked family blocked, not available, despite free quota', () => {
+  const output = renderStatus(blockedStatus(['*fable*']), { color: false, now });
+  // Fable has 89% headroom and the session bucket is nearly empty, so the
+  // quota-only path would have rendered "Fable ✓".
+  assert.match(output, /Fable ⊘ blocked/);
+  assert.doesNotMatch(output, /Fable ✓/);
+  assert.match(output, /Opus ✓/); // unrelated families keep reporting quota
+});
+
+test('renderStatus marks a family blocked by a concrete model id, not just a glob', () => {
+  const output = renderStatus(blockedStatus(['claude-fable-5']), { color: false, now });
+  assert.match(output, /Fable ⊘ blocked/);
+});
+
+test('renderStatus leaves families untouched by an unrelated block', () => {
+  const output = renderStatus(blockedStatus(['*sonnet*']), { color: false, now });
+  assert.match(output, /Fable ✓/);
+  assert.match(output, /Opus ✓/);
+});
+
+test('renderStatus reports a fully-blocked route as blocked instead of listing accounts', () => {
+  const status = blockedStatus(['*fable*']);
+  status.routes = [{
+    name: 'fable',
+    match: ['*fable*'],
+    autocreated: true,
+    accounts: [{ name: 'a', eligible: true }],
+  }];
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /\*fable\*\s+→ blocked \(auto\)/);
+});
+
+test('renderStatus still lists accounts for a route the blocklist does not cover', () => {
+  const status = blockedStatus(['*fable*']);
+  status.routes = [{
+    name: 'sonnet',
+    match: ['*sonnet*'],
+    autocreated: true,
+    accounts: [{ name: 'a', eligible: true }],
+  }];
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /\*sonnet\*\s+→ a \(auto\)/);
 });

@@ -62,14 +62,14 @@ function parsePort(p) {
  * Open a CONNECT tunnel through an HTTP proxy to targetHost:targetPort and
  * resolve with the raw (still-plaintext) socket once the proxy answers 200.
  */
-export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, targetPort, timeout = CONNECT_TIMEOUT_MS }) {
+export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, targetPort, timeout = CONNECT_TIMEOUT_MS, label = 'sx.org proxy' }) {
   return new Promise((resolve, reject) => {
     // autoSelectFamily (happy-eyeballs) — default on Node 20+ but not 18; set it
     // so a dual-stack proxy host whose IPv6 path is unreachable falls back to IPv4
     // instead of hanging the connect (sx.org returns an IP, but be robust).
     const sock = net.connect({ port: proxyPort, host: proxyHost, autoSelectFamily: true });
     let buf = '';
-    const timer = setTimeout(() => fail(new Error(`sx.org proxy CONNECT timed out after ${timeout}ms`)), timeout);
+    const timer = setTimeout(() => fail(new Error(`${label} CONNECT timed out after ${timeout}ms`)), timeout);
     const cleanup = () => {
       clearTimeout(timer);
       sock.removeListener('data', onData);
@@ -79,10 +79,10 @@ export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, ta
     const onData = (chunk) => {
       buf += chunk.toString('latin1');
       const idx = buf.indexOf('\r\n\r\n');
-      if (idx < 0) { if (buf.length > 65536) fail(new Error('sx.org proxy CONNECT response too large')); return; }
+      if (idx < 0) { if (buf.length > 65536) fail(new Error(`${label} CONNECT response too large`)); return; }
       const statusLine = buf.slice(0, buf.indexOf('\r\n'));
       const m = statusLine.match(/^HTTP\/\d\.\d\s+(\d{3})/);
-      if (!m || m[1] !== '200') { fail(new Error(`sx.org proxy refused CONNECT: ${statusLine}`)); return; }
+      if (!m || m[1] !== '200') { fail(new Error(`${label} refused CONNECT: ${statusLine}`)); return; }
       cleanup();
       sock.pause(); // stop flowing so the TLS layer we hand it to sees every byte
       const rest = Buffer.from(buf.slice(idx + 4), 'latin1'); // bytes already past the header
