@@ -84,3 +84,55 @@ test('env TEAMCLAUDE_OVER_CAP_ORDER overrides config; junk values fall back to l
 test('getStatus exposes overCapOrder', () => {
   assert.equal(fleet('priority').getStatus().sessionAffinity.overCapOrder, 'priority');
 });
+
+// --- 'weighted': every account works, lower priority just works less ---------
+
+test('weighted: nothing is starved and shares follow 1 : 1/2 : 1/3 : 1/4', () => {
+  const am = new AccountManager(
+    [oauth('a0', 0), oauth('b1', 1), oauth('c2', 2), oauth('d3', 3)],
+    0.98,
+    { affinity: { enabled: true, maxPerAccount: 2, overCapOrder: 'weighted' } },
+  );
+  for (const a of am.accounts) a.probing = false;
+  const c = place(am, 100);
+  for (const n of ['a0', 'b1', 'c2', 'd3']) {
+    assert.ok(c[n] > 0, `${n} must keep taking work, got ${JSON.stringify(c)}`);
+  }
+  // Monotonic: a lower priority value always carries at least as much.
+  assert.ok(c.a0 > c.b1 && c.b1 > c.c2 && c.c2 > c.d3, JSON.stringify(c));
+  // Ratios within a session of the ideal 48/24/16/12 for 100 sessions.
+  assert.ok(Math.abs(c.a0 / c.b1 - 2) < 0.35, `a0/b1 ≈ 2, got ${c.a0 / c.b1}`);
+  assert.ok(Math.abs(c.a0 / c.d3 - 4) < 0.7, `a0/d3 ≈ 4, got ${c.a0 / c.d3}`);
+});
+
+test('weighted: same priority still shares evenly', () => {
+  const am = new AccountManager(
+    [oauth('a0', 0), oauth('b0', 0)],
+    0.98,
+    { affinity: { enabled: true, maxPerAccount: 2, overCapOrder: 'weighted' } },
+  );
+  for (const a of am.accounts) a.probing = false;
+  const c = place(am, 20);
+  assert.equal(Math.abs(c.a0 - c.b0) <= 1, true, JSON.stringify(c));
+});
+
+test('weighted: an unavailable account is skipped, the rest keep their ratios', () => {
+  const am = new AccountManager(
+    [oauth('a0', 0), oauth('b1', 1), oauth('c2', 2)],
+    0.98,
+    { affinity: { enabled: true, maxPerAccount: 2, overCapOrder: 'weighted' } },
+  );
+  for (const a of am.accounts) a.probing = false;
+  am.accounts[0].status = 'exhausted';
+  const c = place(am, 30);
+  assert.equal(c.a0, undefined, 'exhausted account takes nothing');
+  assert.ok(c.b1 > 0 && c.c2 > 0, 'the others both keep working');
+  assert.ok(c.b1 > c.c2, `priority still shapes the split, got ${JSON.stringify(c)}`);
+});
+
+test('weighted is accepted from env and config', () => {
+  process.env.TEAMCLAUDE_OVER_CAP_ORDER = 'weighted';
+  try { assert.equal(fleet('load').affinity.overCapOrder, 'weighted'); }
+  finally { delete process.env.TEAMCLAUDE_OVER_CAP_ORDER; }
+  assert.equal(fleet('weighted').affinity.overCapOrder, 'weighted');
+});

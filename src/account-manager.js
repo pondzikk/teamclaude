@@ -203,16 +203,21 @@ export class AccountManager {
       //                Right for a fleet of interchangeable accounts.
       //   'priority' — balance by load WITHIN the best available priority tier;
       //                spill to the next tier only when the whole tier is
-      //                unavailable (exhausted / paused / excluded). Gives a strict
-      //                burn order across tiers: lower priority value drains first,
-      //                a shared or reserved account (higher value) is touched last.
-      //                A single-account tier will concentrate load — that is the
-      //                operator's stated intent, not a bug; raise
-      //                TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS so per-minute 429s
-      //                are waited out inline instead of surfacing.
-      overCapOrder: ['load', 'priority'].includes(process.env.TEAMCLAUDE_OVER_CAP_ORDER)
+      //                unavailable (exhausted / paused / excluded). A strict burn
+      //                order — but a tier that is down to one usable account
+      //                carries the entire fleet, which is a real cost: measured
+      //                85 sessions on one account once its tier partner crossed
+      //                switchThreshold.
+      //   'weighted' — EVERY available account takes work, but a share inversely
+      //                proportional to its priority: the placer minimises
+      //                (load+1) × (priority+1), so priority 0 takes ~2× the
+      //                sessions of priority 1, ~3× of priority 2, ~4× of
+      //                priority 3. Nothing is starved and nothing is a
+      //                bottleneck — for "the shared account should still be
+      //                used, just more slowly" rather than "not at all".
+      overCapOrder: ['load', 'priority', 'weighted'].includes(process.env.TEAMCLAUDE_OVER_CAP_ORDER)
         ? process.env.TEAMCLAUDE_OVER_CAP_ORDER
-        : (['load', 'priority'].includes(aff.overCapOrder) ? aff.overCapOrder : 'load'),
+        : (['load', 'priority', 'weighted'].includes(aff.overCapOrder) ? aff.overCapOrder : 'load'),
     };
     // Fable-reserve: Fable meters its OWN small weekly bucket, separate from the
     // shared 5h/weekly. Once most accounts' Fable bucket is spent, only the few
@@ -421,18 +426,27 @@ export class AccountManager {
       // still Fable's only home. Always 0 when the feature is off / for Fable
       // requests, so the ranking is otherwise unchanged.
       const reserve = this._reservesFable(account, model, advisorModel) ? 1 : 0;
-      // 'priority' order: the tier is the leading key, ABOVE the under/over-cap
-      // split. Otherwise a lower tier's still-under-cap account (leading 0)
-      // would outrank the preferred tier the moment it crosses the cap (leading
-      // 1) — measured: 2 sessions leaked onto each lower tier per fill. Here the
-      // cap only orders accounts WITHIN a tier (fill the under-cap ones first,
-      // then balance by load), so 2+ accounts at the same priority share evenly
-      // and a lower tier is touched only when the whole tier above is unavailable.
-      const key = this.affinity.overCapOrder === 'priority'
-        ? [reserve, prio, over ? 1 : 0, paused, load, inFlight, reset] // tiered burn order
-        : (over
-          ? [reserve, 1, paused, load, inFlight, prio, reset]   // saturated → balance by load
-          : [reserve, 0, prio, paused, load, inFlight, reset]); // normal → drain by priority
+      // 'weighted': every available account keeps taking work, but a share
+      // inversely proportional to its priority. Minimising (load+1)×(prio+1)
+      // makes a priority-1 account accept its next session only once it is
+      // roughly half as loaded as a priority-0 one, so the ratios settle at
+      // 1 : 1/2 : 1/3 : 1/4 across priorities 0..3. The cap plays no part —
+      // this is a continuous share, not a fill-then-spill.
+      //
+      // 'priority': the tier is the leading key, ABOVE the under/over-cap split.
+      // Otherwise a lower tier's still-under-cap account (leading 0) would
+      // outrank the preferred tier the moment it crosses the cap (leading 1) —
+      // measured: 2 sessions leaked onto each lower tier per fill. Note this
+      // STARVES lower tiers entirely while the top tier lives; use 'weighted'
+      // when they should still be used, only less.
+      const weighted = (load + 1) * (prio + 1);
+      const key = this.affinity.overCapOrder === 'weighted'
+        ? [reserve, paused, weighted, prio, load, inFlight, reset]      // proportional share
+        : this.affinity.overCapOrder === 'priority'
+          ? [reserve, prio, over ? 1 : 0, paused, load, inFlight, reset] // tiered burn order
+          : (over
+            ? [reserve, 1, paused, load, inFlight, prio, reset]   // saturated → balance by load
+            : [reserve, 0, prio, paused, load, inFlight, reset]); // normal → drain by priority
       if (!best || keyLess(key, bestKey)) { best = account; bestKey = key; }
     }
     return best;
