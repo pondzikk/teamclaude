@@ -196,6 +196,23 @@ export class AccountManager {
       // Hard size cap: session ids are client-supplied (every one-shot
       // `claude -p` is a fresh id), so TTL alone can't bound the map.
       maxTracked: Number(process.env.TEAMCLAUDE_MAX_TRACKED_SESSIONS) || aff.maxTracked || 5000,
+      // How a NEW session is placed once every eligible account is at/over the
+      // soft cap (fleet saturated — the normal state for an operator running
+      // dozens of sessions):
+      //   'load'     — balance by load; priority is only a late tiebreak. Default.
+      //                Right for a fleet of interchangeable accounts.
+      //   'priority' — balance by load WITHIN the best available priority tier;
+      //                spill to the next tier only when the whole tier is
+      //                unavailable (exhausted / paused / excluded). Gives a strict
+      //                burn order across tiers: lower priority value drains first,
+      //                a shared or reserved account (higher value) is touched last.
+      //                A single-account tier will concentrate load — that is the
+      //                operator's stated intent, not a bug; raise
+      //                TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS so per-minute 429s
+      //                are waited out inline instead of surfacing.
+      overCapOrder: ['load', 'priority'].includes(process.env.TEAMCLAUDE_OVER_CAP_ORDER)
+        ? process.env.TEAMCLAUDE_OVER_CAP_ORDER
+        : (['load', 'priority'].includes(aff.overCapOrder) ? aff.overCapOrder : 'load'),
     };
     // Fable-reserve: Fable meters its OWN small weekly bucket, separate from the
     // shared 5h/weekly. Once most accounts' Fable bucket is spent, only the few
@@ -404,9 +421,18 @@ export class AccountManager {
       // still Fable's only home. Always 0 when the feature is off / for Fable
       // requests, so the ranking is otherwise unchanged.
       const reserve = this._reservesFable(account, model, advisorModel) ? 1 : 0;
-      const key = over
-        ? [reserve, 1, paused, load, inFlight, prio, reset]   // saturated → balance by load
-        : [reserve, 0, prio, paused, load, inFlight, reset];  // normal → drain by priority
+      // 'priority' order: the tier is the leading key, ABOVE the under/over-cap
+      // split. Otherwise a lower tier's still-under-cap account (leading 0)
+      // would outrank the preferred tier the moment it crosses the cap (leading
+      // 1) — measured: 2 sessions leaked onto each lower tier per fill. Here the
+      // cap only orders accounts WITHIN a tier (fill the under-cap ones first,
+      // then balance by load), so 2+ accounts at the same priority share evenly
+      // and a lower tier is touched only when the whole tier above is unavailable.
+      const key = this.affinity.overCapOrder === 'priority'
+        ? [reserve, prio, over ? 1 : 0, paused, load, inFlight, reset] // tiered burn order
+        : (over
+          ? [reserve, 1, paused, load, inFlight, prio, reset]   // saturated → balance by load
+          : [reserve, 0, prio, paused, load, inFlight, reset]); // normal → drain by priority
       if (!best || keyLess(key, bestKey)) { best = account; bestKey = key; }
     }
     return best;
@@ -1669,6 +1695,7 @@ export class AccountManager {
         enabled: this.affinity.enabled,
         maxPerAccount: this.affinity.maxPerAccount,
         ttlMinutes: Math.round(this.affinity.ttlMs / 60_000),
+        overCapOrder: this.affinity.overCapOrder,
         activeSessions: this.sessions.size,
       },
       routes: this.getRoutes(),
