@@ -14,6 +14,7 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
+import { ModelHealth, isLocalFault } from './model-health.js';
 import {
   anthropicToOpenAIRequest, openAIToAnthropicResponse, openAIToAnthropicError,
   translateOpenAIStream, openAIChatCompletionsUrl,
@@ -204,7 +205,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, console.error);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress });
+  // One breaker for the whole server, so the base listener and the MITM one
+  // share what they have learned about a model (a request through either is
+  // evidence for both).
+  const modelHealth = new ModelHealth(config.modelHealth || {});
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, modelHealth });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -372,7 +377,8 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, modelHealth = null }) {
+  const health = modelHealth || new ModelHealth(config.modelHealth || {});
   let counter = 0;
   return async (req, res) => {
     try {
@@ -522,7 +528,27 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // sends it, and SessionIdFinder's body parse (metadata.user_id) covers
       // clients that don't. Affinity binds on whichever answers.
       const effectiveSessionId = sessionId ?? sessionFinder?.value ?? null;
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId: effectiveSessionId };
+      // Provider-outage short-circuit. Only fires when the breaker has proof the
+      // network is up and two different accounts failed this model the same way
+      // (see model-health.js) — a bad local link can never reach this branch, so
+      // a flaky connection keeps its normal long timeout and retries.
+      if (health.isOpen(model)) {
+        const retryAfter = health.retryAfterSeconds(model);
+        if (!res.headersSent) {
+          res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'api_error',
+              message: `Upstream provider is failing for model "${model}" on every account teamclaude tried — this is the provider, not the proxy or your connection. Check https://status.claude.com. Retrying in ${retryAfter}s; another model (e.g. Haiku) may still work.`,
+            },
+          }));
+        }
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(model down)', status: 503, model, sessionId: effectiveSessionId });
+        return;
+      }
+
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId: effectiveSessionId, health };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1194,6 +1220,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       responseHeaders[key] = value;
     }
 
+    // Outcome for the provider-outage breaker. A 5xx is the provider failing on
+    // a connection that demonstrably works; anything else (including 4xx and
+    // 429) means they answered us, which proves both the link and the model.
+    if (upstreamRes.status >= 500) {
+      const e = new Error(`upstream ${upstreamRes.status}`);
+      e.code = 'TEAMCLAUDE_UPSTREAM_5XX';
+      if (ctx.health?.recordFailure(ctx.model, account.index, e)) {
+        console.error(`[TeamClaude] Model "${ctx.model}" looks down at the provider (${upstreamRes.status} on ${ctx.health.getStatus().openModels[0]?.accounts} accounts) — short-circuiting for ${ctx.health.retryAfterSeconds(ctx.model)}s`);
+      }
+    } else {
+      ctx.health?.recordSuccess(ctx.model);
+    }
+
     res.writeHead(upstreamRes.status, responseHeaders);
 
     if (!upstreamRes.body) {
@@ -1245,6 +1284,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
         err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
         err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
+
+    // Feed the provider-outage breaker. isLocalFault() filters out DNS/connect
+    // failures, and the breaker itself refuses to arm without a recent success
+    // somewhere — so on a train (everything failing, nothing succeeding) this
+    // records nothing and behaviour below is exactly as before.
+    if (!isLocalFault(err) && ctx.health?.recordFailure(ctx.model, account.index, err)) {
+      console.error(`[TeamClaude] Model "${ctx.model}" looks down at the provider (same failure on 2+ accounts while other traffic flows) — short-circuiting for ${ctx.health.retryAfterSeconds(ctx.model)}s`);
+    }
 
     // Transient network errors (including a stale-socket headers/body timeout):
     // close the connection and let the client retry. Failing over to another
