@@ -81,7 +81,17 @@ function makeAccount(acct, index) {
     usage: {
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      // Cache tokens are the DOMINANT term in real traffic — measured on a live
+      // fleet, cache reads were 54.5B of 57.3B tokens (95%). Counting only
+      // input/output measures ~5% of what an account actually delivered, which
+      // is useless for any per-account capacity or cost question.
+      totalCacheCreationTokens: 0,
+      totalCacheReadTokens: 0,
       totalRequests: 0,
+      // Per-model split. Models do not consume quota at the same rate per
+      // token, so a bare token sum is only comparable across accounts that
+      // happened to run the same model mix — which they never do.
+      byModel: {},
       lastUsed: null,
     },
     rateLimitedUntil: null,
@@ -1493,11 +1503,34 @@ export class AccountManager {
   /**
    * Update cumulative token usage from response body data.
    */
-  updateUsage(accountIndex, inputTokens, outputTokens) {
+  updateUsage(accountIndex, inputTokens, outputTokens, usageObj = null, model = null) {
     const account = this.accounts[accountIndex];
     if (!account) return;
-    if (inputTokens) account.usage.totalInputTokens += inputTokens;
-    if (outputTokens) account.usage.totalOutputTokens += outputTokens;
+    const u = account.usage;
+    if (inputTokens) u.totalInputTokens += inputTokens;
+    if (outputTokens) u.totalOutputTokens += outputTokens;
+
+    // Cache counters and the per-model split only exist when the caller hands
+    // over the whole usage object. The two positional args are kept so the
+    // older call sites (and the OpenAI translator's onUsage) keep working
+    // unchanged — they simply contribute nothing to the cache totals.
+    const cc = Number(usageObj?.cache_creation_input_tokens) || 0;
+    const cr = Number(usageObj?.cache_read_input_tokens) || 0;
+    if (cc) u.totalCacheCreationTokens += cc;
+    if (cr) u.totalCacheReadTokens += cr;
+
+    if (model) {
+      const m = (u.byModel[model] ||= { input: 0, output: 0, cacheCreation: 0, cacheRead: 0, requests: 0 });
+      if (inputTokens) m.input += inputTokens;
+      if (outputTokens) m.output += outputTokens;
+      if (cc) m.cacheCreation += cc;
+      if (cr) m.cacheRead += cr;
+      // One request per terminal usage report: streaming sends input at
+      // message_start and output at message_delta, so count on the output leg
+      // to avoid double counting a single exchange.
+      if (outputTokens) m.requests += 1;
+    }
+    if (inputTokens || outputTokens || cc || cr) u.lastUsed = Date.now();
   }
 
   /**

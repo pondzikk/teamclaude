@@ -15,6 +15,7 @@ import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { ModelHealth, isLocalFault } from './model-health.js';
+import { journalResponse, journalEnabled } from './quota-journal.js';
 import {
   anthropicToOpenAIRequest, openAIToAnthropicResponse, openAIToAnthropicError,
   translateOpenAIStream, openAIChatCompletionsUrl,
@@ -1439,6 +1440,29 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
+// A streaming response reports its model once, in message_start; the closing
+// message_delta (which carries the output tokens) does not repeat it. Remember
+// the last model seen per account so the output leg lands in the right bucket.
+const lastSseModel = new Map();
+// A streaming exchange reports input+cache tokens in message_start and output in
+// message_delta. The journal wants ONE row per exchange with both, so the
+// opening half is parked here until the closing half arrives.
+const pendingSseUsage = new Map();
+
+function sseModel(accountManager, accountIndex) {
+  return lastSseModel.get(accountIndex) || null;
+}
+
+// Emit one journal row for a completed exchange. Reads quota straight off the
+// account, which updateQuota has already refreshed from this response's
+// rate-limit headers — so the row pairs the work with the quota state it caused.
+function journalExchange(accountManager, accountIndex, usage, model) {
+  if (!journalEnabled()) return;
+  const account = accountManager.accounts[accountIndex];
+  if (!account) return;
+  journalResponse({ account: account.name, model, usage, quota: account.quota, status: 200 });
+}
+
 function parseSSEUsage(event, accountIndex, accountManager) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
@@ -1446,9 +1470,20 @@ function parseSSEUsage(event, accountIndex, accountManager) {
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      // message_start is where the cache counters live — the delta only carries
+      // output. Pass the whole usage object so they are not lost.
+      if (data.message.model) lastSseModel.set(accountIndex, data.message.model);
+      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0,
+        data.message.usage, data.message.model || null);
+      if (journalEnabled()) pendingSseUsage.set(accountIndex, { ...data.message.usage });
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      const model = sseModel(accountManager, accountIndex);
+      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens, data.usage, model);
+      if (journalEnabled()) {
+        const opening = pendingSseUsage.get(accountIndex) || {};
+        pendingSseUsage.delete(accountIndex);
+        journalExchange(accountManager, accountIndex, { ...opening, ...data.usage }, model);
+      }
     }
   } catch {
     // not valid JSON, skip
@@ -1472,7 +1507,9 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens,
+        json.usage, json.model || null);
+      journalExchange(accountManager, accountIndex, json.usage, json.model || null);
     }
   } catch {
     // not JSON or no usage
