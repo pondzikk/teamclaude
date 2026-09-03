@@ -30,8 +30,21 @@ test('probing is throttled to one account per probe interval', () => {
   exhaust(am.accounts[1], 0.99);
 
   assert.ok(am.getActiveAccount(), 'first call probes');
-  // A second request inside the interval must refuse (synthetic 429), not probe again.
-  assert.equal(am.getActiveAccount(), null);
+  const probeAt = am._nextProbeAt;
+  // A second request inside the interval must not probe AGAIN — but it is still
+  // served, by the last-resort path: both accounts read 0.99, and the band
+  // between switchThreshold and a full bucket exists to be spent once nothing
+  // fresher is available. The probe throttle is unchanged; only the fallback
+  // behind it is (a synthetic 429 used to stand here).
+  assert.ok(am.getActiveAccount(), 'last resort serves while the probe is throttled');
+  assert.equal(am._nextProbeAt, probeAt, 'and it did not consume another probe');
+
+  // With last resort off, the historical refuse-locally behaviour is intact.
+  const strict = new AccountManager([oauth('a'), oauth('b')], 0.98, { affinity: { lastResort: false } });
+  exhaust(strict.accounts[0], 0.99);
+  exhaust(strict.accounts[1], 0.99);
+  assert.ok(strict.getActiveAccount(), 'first call probes');
+  assert.equal(strict.getActiveAccount(), null, 'then refuses, as before');
 
   // Once the interval elapses, a probe is allowed again.
   am._nextProbeAt = Date.now() - 1;

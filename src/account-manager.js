@@ -219,6 +219,9 @@ export class AccountManager {
         ? process.env.TEAMCLAUDE_OVER_CAP_ORDER
         : (['load', 'priority', 'weighted'].includes(aff.overCapOrder) ? aff.overCapOrder : 'load'),
     };
+    // Spend the band between switchThreshold and a genuinely full bucket, but
+    // only once nothing else can serve the request (see _selectLastResort).
+    this.lastResort = process.env.TEAMCLAUDE_LAST_RESORT === '0' ? false : (aff.lastResort !== false);
     // Fable-reserve: Fable meters its OWN small weekly bucket, separate from the
     // shared 5h/weekly. Once most accounts' Fable bucket is spent, only the few
     // accounts that still have Fable headroom can serve Fable — but nothing stops
@@ -612,7 +615,14 @@ export class AccountManager {
     // permanent "all exhausted" state — the probe's real response refreshes the
     // quota (or upstream's own 429 converts soft exhaustion into a hard
     // rate-limit hold). null here means the caller emits the synthetic 429.
-    return allowProbe ? this._selectProbe(exclude, model) : null;
+    const probe = allowProbe ? this._selectProbe(exclude, model) : null;
+    if (probe) return probe;
+    // Still nothing, and the probe is throttled to once a minute. switchThreshold
+    // exists to stop draining an account while a fresher one is available — with
+    // none available it buys nothing, and the last 2% of every account would sit
+    // unused behind a synthetic 429 we invented ourselves. Spend it: let the
+    // provider's real 429 be the authority on "exhausted", not our soft bar.
+    return this._selectLastResort(exclude, model, advisorModel);
   }
 
   /** Session-affinity selection (opt-in, issue #109). Honor a known session's
@@ -799,6 +809,56 @@ export class AccountManager {
     const key = this._weeklyBucketFor(model);
     if (key === 'unified7d') return false;
     return q[key] != null && q[key] >= this.switchThreshold;
+  }
+
+  /**
+   * Last resort: every account reads as over switchThreshold and the revalidation
+   * probe is throttled, so the alternative is a synthetic 429 we generate
+   * ourselves. Serve the request from the least-utilized account that is not
+   * HARD-unavailable and let the provider decide.
+   *
+   * What still disqualifies an account here — all of them are states where the
+   * request would certainly fail, so spending a retry on them helps nobody:
+   *   disabled            operator took it out of rotation
+   *   status 'error'      credential is rejected; needs re-login
+   *   pausedUntil         a real upstream 429 with a retry-after still running
+   *   route/ownership     the account cannot serve this model id at all
+   *   quota >= 1.0        the provider itself says the bucket is empty
+   *
+   * Deliberately NOT disqualifying: utilization between switchThreshold and 1.0.
+   * That band is exactly what this exists to spend. Enabled by default because
+   * it only ever runs where the alternative is failing the request; set
+   * `sessionAffinity.lastResort: false` (or TEAMCLAUDE_LAST_RESORT=0) to keep
+   * the old behaviour of refusing locally.
+   */
+  _selectLastResort(exclude = null, model = null, advisorModel = null) {
+    if (!this.lastResort) return null;
+    const now = Date.now();
+    let best = null;
+    let bestUsage = Infinity;
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index)) continue;
+      if (account.disabled) continue;
+      // A LIVE upstream rate-limit hold. This is the provider telling us to wait
+      // a specific time; ignoring it would just burn a request into a wall and
+      // is the one thing this must never do. Note the field is rateLimitedUntil
+      // (set by markRateLimited) — pausedUntil is the SOFT admission pause and
+      // deliberately leaves an account available, so it must not disqualify here.
+      if (account.status === 'throttled' && account.rateLimitedUntil && now < account.rateLimitedUntil) continue;
+      // Genuinely spent or credential-dead: nothing to drain.
+      if (account.status === 'exhausted' || account.status === 'error') continue;
+      if (model && !this._routeAllows(account, model)) continue;
+      if (advisorModel && !this._routeAllows(account, advisorModel)) continue;
+      // Only a bucket the provider reports as genuinely full is out; anything
+      // below 1.0 still has something left to give.
+      const usage = this._maxUtilization(account, model);
+      if (usage >= 1) continue;
+      if (usage < bestUsage) { bestUsage = usage; best = account; }
+    }
+    if (best) {
+      console.log(`[TeamClaude] Last resort: every account is over the ${Math.round(this.switchThreshold * 100)}% switch threshold — draining "${best.name}" at ${Math.round(bestUsage * 100)}% rather than refusing locally`);
+    }
+    return best;
   }
 
   /**
