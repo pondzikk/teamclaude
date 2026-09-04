@@ -16,6 +16,7 @@ import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { ModelHealth, isLocalFault } from './model-health.js';
 import { journalResponse, journalEnabled } from './quota-journal.js';
+import { startQuotaSnapshots } from './quota-snapshot.js';
 import {
   anthropicToOpenAIRequest, openAIToAnthropicResponse, openAIToAnthropicError,
   translateOpenAIStream, openAIChatCompletionsUrl,
@@ -233,6 +234,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   // needs its own listener (base-URL routing path; the MITM path wires the
   // same relayUpgrade onto its own terminating server in mitm.js).
   server.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
+
+  // Even, traffic-independent quota time series (TEAMCLAUDE_QUOTA_SNAPSHOT). No-op
+  // when unconfigured; the timer is unref'd so it never holds the process open.
+  startQuotaSnapshots(accountManager);
 
   return server;
 }
