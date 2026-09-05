@@ -233,6 +233,24 @@ export class AccountManager {
       // at reset is lost — so it temporarily drops to the drain-first tier regardless
       // of its configured spare-priority (see _pickForNewSession). 0 = off (default).
       expiryHours: Number(process.env.TEAMCLAUDE_EXPIRY_HOURS) || aff.expiryHours || 0,
+      // Overload flattening. Spare-priority ordering is right when the fleet is
+      // idle — it protects the accounts the operator wants held back. Under heavy
+      // fanout it is the wrong shape: the top tier absorbs most of the work and
+      // rate-limits while spared accounts sit idle. So above this many TOTAL bound
+      // sessions, every account below `flattenKeepPriority` collapses to the
+      // drain-first tier and the fleet spreads evenly; the configured burn order
+      // returns as soon as the load drops. Temporary and stateless — it is
+      // recomputed per placement, and existing bindings are never moved.
+      // 0 = off (default).
+      flattenAbove: Number(process.env.TEAMCLAUDE_FLATTEN_ABOVE) || aff.flattenAbove || 0,
+      // Priorities at or above this are NEVER flattened: the reserve that must
+      // survive a busy period (e.g. an account approved for a specific class of
+      // work and deliberately kept out of general rotation — flattening it would
+      // drain exactly the capacity it is being held for). null = nothing is
+      // protected, i.e. flattening applies to the whole fleet.
+      flattenKeepPriority: process.env.TEAMCLAUDE_FLATTEN_KEEP_PRIORITY != null
+        ? Number(process.env.TEAMCLAUDE_FLATTEN_KEEP_PRIORITY)
+        : (aff.flattenKeepPriority ?? null),
     };
     // Spend the band between switchThreshold and a genuinely full bucket, but
     // only once nothing else can serve the request (see _selectLastResort).
@@ -261,6 +279,41 @@ export class AccountManager {
   /** Sessions currently bound to account `index` (the affinity load metric). */
   _sessionCount(index) {
     return this._sessionCounts[index] || 0;
+  }
+
+  /** Sessions bound across the whole fleet — the overload signal for
+   *  affinity.flattenAbove. */
+  _totalBoundSessions() {
+    let n = 0;
+    for (const c of this._sessionCounts) n += c || 0;
+    return n;
+  }
+
+  /** True while the fleet carries more than affinity.flattenAbove sessions. */
+  _isOverloaded() {
+    return this.affinity.flattenAbove > 0
+      && this._totalBoundSessions() > this.affinity.flattenAbove;
+  }
+
+  /**
+   * Effective placement priority for `account` (lower = drained first). Two
+   * TEMPORARY demotions stack on top of the configured priority:
+   *   FEFO (affinity.expiryHours) — quota resetting within the window is
+   *     perishable, so it burns first whatever spare-priority it carries.
+   *   Overload flattening (affinity.flattenAbove) — while the fleet is loaded,
+   *     spare tiers below flattenKeepPriority collapse to 0 so every usable
+   *     account takes a full share. Tiers at/above flattenKeepPriority are left
+   *     alone, so a deliberately reserved account is not drained by a busy spell.
+   * Both are recomputed per placement and never move an existing binding.
+   * `resetAt` is returned too because callers reuse it as the fine tiebreak.
+   */
+  _effectivePriority(account, model, now, overloaded) {
+    const resetAt = this._governingWeeklyReset(account, model);
+    let prio = (this.affinity.expiryHours > 0 && resetAt
+      && resetAt - now <= this.affinity.expiryHours * 3600_000) ? 0 : (account.priority || 0);
+    const keep = this.affinity.flattenKeepPriority;
+    if (overloaded && (keep == null || prio < keep)) prio = 0;
+    return { prio, resetAt };
   }
 
   /** Drop session bindings idle past the TTL. */
@@ -429,6 +482,7 @@ export class AccountManager {
     let best = null;
     let bestKey = null;
     const now = Date.now();
+    const overloaded = this._isOverloaded();
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (!this._isAvailable(account, model, advisorModel)) continue;
@@ -436,16 +490,13 @@ export class AccountManager {
       const over = load >= this.affinity.maxPerAccount;
       const paused = account.pausedUntil && account.pausedUntil > now ? 1 : 0;
       const inFlight = account.inFlight || 0;
-      const resetAt = this._governingWeeklyReset(account, model);
+      // Effective priority = configured priority, temporarily demoted by FEFO
+      // (perishable quota burns first) and by overload flattening (spare tiers
+      // take a full share while the fleet is busy). See _effectivePriority. The
+      // raw `reset` stays the final tiebreak, so among equal-priority accounts
+      // the soonest to reset still wins (fine-grained FEFO within a tier).
+      const { prio, resetAt } = this._effectivePriority(account, model, now, overloaded);
       const reset = resetAt || -Infinity;
-      // Expiry priority: quota that resets soon is perishable, so an account whose
-      // governing weekly reset is within affinity.expiryHours drops to the drain-first
-      // tier (effective priority 0) — its quota is spent before it evaporates, whatever
-      // spare-priority it was given. Off (0) leaves priority untouched. The raw `reset`
-      // above stays the final tiebreak, so among equal-priority accounts the soonest to
-      // reset still wins (fine-grained FEFO within a tier).
-      const prio = (this.affinity.expiryHours > 0 && resetAt
-        && resetAt - now <= this.affinity.expiryHours * 3600_000) ? 0 : (account.priority || 0);
       // Fable-reserve is the PRIMARY discriminator (see _reservesFable): a
       // non-Fable request prefers every Fable-spent account over every
       // Fable-capable one, so general traffic doesn't drain the accounts that are
@@ -1345,6 +1396,8 @@ export class AccountManager {
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
     let best = null;
     let bestKey = null;
+    const now = Date.now();
+    const overloaded = this._isOverloaded();
 
     for (let i = 0; i < this.accounts.length; i++) {
       const account = this.accounts[i];
@@ -1363,13 +1416,10 @@ export class AccountManager {
       // Sonnet have their own), so a Fable request spends the account whose Fable
       // window refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
-      const resetAt = this._governingWeeklyReset(account, model);
+      // Effective priority — FEFO + overload flattening, exactly as in
+      // _pickForNewSession (see _effectivePriority); weeklyReset stays the tiebreak.
+      const { prio: priority, resetAt } = this._effectivePriority(account, model, now, overloaded);
       const weeklyReset = resetAt || -Infinity;
-      // Expiry priority: a soon-resetting account has perishable quota, so drop it
-      // to the drain-first tier (effective priority 0) — mirrors _pickForNewSession.
-      // Off (expiryHours 0) leaves priority untouched; weeklyReset stays the tiebreak.
-      const priority = (this.affinity.expiryHours > 0 && resetAt
-        && resetAt - Date.now() <= this.affinity.expiryHours * 3600_000) ? 0 : (account.priority || 0);
       const key = [reserve, priority, weeklyReset];
       if (!best || keyLess(key, bestKey)) { best = account; bestKey = key; }
     }
@@ -1819,6 +1869,9 @@ export class AccountManager {
       sessionAffinity: {
         enabled: this.affinity.enabled,
         maxPerAccount: this.affinity.maxPerAccount,
+        flattenAbove: this.affinity.flattenAbove,
+        flattenKeepPriority: this.affinity.flattenKeepPriority,
+        overloaded: this._isOverloaded(),
         ttlMinutes: Math.round(this.affinity.ttlMs / 60_000),
         overCapOrder: this.affinity.overCapOrder,
         activeSessions: this.sessions.size,
