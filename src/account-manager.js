@@ -228,6 +228,11 @@ export class AccountManager {
       overCapOrder: ['load', 'priority', 'weighted'].includes(process.env.TEAMCLAUDE_OVER_CAP_ORDER)
         ? process.env.TEAMCLAUDE_OVER_CAP_ORDER
         : (['load', 'priority', 'weighted'].includes(aff.overCapOrder) ? aff.overCapOrder : 'load'),
+      // Expiry priority (first-expire-first-out): an account whose governing weekly
+      // window resets within this many hours has PERISHABLE quota — anything unburned
+      // at reset is lost — so it temporarily drops to the drain-first tier regardless
+      // of its configured spare-priority (see _pickForNewSession). 0 = off (default).
+      expiryHours: Number(process.env.TEAMCLAUDE_EXPIRY_HOURS) || aff.expiryHours || 0,
     };
     // Spend the band between switchThreshold and a genuinely full bucket, but
     // only once nothing else can serve the request (see _selectLastResort).
@@ -430,9 +435,17 @@ export class AccountManager {
       const load = this._sessionCount(account.index);
       const over = load >= this.affinity.maxPerAccount;
       const paused = account.pausedUntil && account.pausedUntil > now ? 1 : 0;
-      const prio = account.priority || 0;
       const inFlight = account.inFlight || 0;
-      const reset = this._governingWeeklyReset(account, model) || -Infinity;
+      const resetAt = this._governingWeeklyReset(account, model);
+      const reset = resetAt || -Infinity;
+      // Expiry priority: quota that resets soon is perishable, so an account whose
+      // governing weekly reset is within affinity.expiryHours drops to the drain-first
+      // tier (effective priority 0) — its quota is spent before it evaporates, whatever
+      // spare-priority it was given. Off (0) leaves priority untouched. The raw `reset`
+      // above stays the final tiebreak, so among equal-priority accounts the soonest to
+      // reset still wins (fine-grained FEFO within a tier).
+      const prio = (this.affinity.expiryHours > 0 && resetAt
+        && resetAt - now <= this.affinity.expiryHours * 3600_000) ? 0 : (account.priority || 0);
       // Fable-reserve is the PRIMARY discriminator (see _reservesFable): a
       // non-Fable request prefers every Fable-spent account over every
       // Fable-capable one, so general traffic doesn't drain the accounts that are
@@ -1346,12 +1359,17 @@ export class AccountManager {
       // so general traffic doesn't drain Fable's last homes. 0 for everyone when
       // the feature is off / for Fable requests → order unchanged below.
       const reserve = this._reservesFable(account, model, advisorModel) ? 1 : 0;
-      const priority = account.priority || 0;
       // Rank by the reset of the weekly bucket that governs THIS model (Fable and
       // Sonnet have their own), so a Fable request spends the account whose Fable
       // window refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
-      const weeklyReset = this._governingWeeklyReset(account, model) || -Infinity;
+      const resetAt = this._governingWeeklyReset(account, model);
+      const weeklyReset = resetAt || -Infinity;
+      // Expiry priority: a soon-resetting account has perishable quota, so drop it
+      // to the drain-first tier (effective priority 0) — mirrors _pickForNewSession.
+      // Off (expiryHours 0) leaves priority untouched; weeklyReset stays the tiebreak.
+      const priority = (this.affinity.expiryHours > 0 && resetAt
+        && resetAt - Date.now() <= this.affinity.expiryHours * 3600_000) ? 0 : (account.priority || 0);
       const key = [reserve, priority, weeklyReset];
       if (!best || keyLess(key, bestKey)) { best = account; bestKey = key; }
     }
