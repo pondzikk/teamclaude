@@ -264,3 +264,42 @@ test('e2e: with the feature ON the pool figure replaces it, everything else surv
     assert.equal(rl.rate_limit_info.isUsingOverage, false);
   } finally { delete process.env.TEAMCLAUDE_FLEET_QUOTA; }
 });
+
+// --- enabling from config (hot-reloadable, no restart) ------------------------
+
+import { setFleetQuotaConfig } from '../src/fleet-quota.js';
+
+test('config turns it on without env, and reload picks up a mutated object', () => {
+  delete process.env.TEAMCLAUDE_FLEET_QUOTA;
+  delete process.env.TEAMCLAUDE_FLEET_QUOTA_CAP;
+  const cfg = {};
+  setFleetQuotaConfig(cfg);
+  try {
+    assert.equal(fleetQuotaEnabled(), false, 'absent config → off');
+
+    // reloadAccounts mutates the SAME object, which is what makes POST
+    // /teamclaude/reload enough — no restart, no torn MITM tunnels.
+    cfg.fleetQuota = { enabled: true, cap: 0.89 };
+    assert.equal(fleetQuotaEnabled(), true);
+    assert.equal(fleetQuotaCap(), 0.89);
+
+    cfg.fleetQuota = { enabled: false };
+    assert.equal(fleetQuotaEnabled(), false, 'and it switches back off just as live');
+    assert.equal(fleetQuotaCap(), null);
+  } finally { setFleetQuotaConfig(null); }
+});
+
+test('env still wins over config', () => {
+  const cfg = { fleetQuota: { enabled: false, cap: 0.5 } };
+  setFleetQuotaConfig(cfg);
+  process.env.TEAMCLAUDE_FLEET_QUOTA = '1';
+  process.env.TEAMCLAUDE_FLEET_QUOTA_CAP = '0.7';
+  try {
+    assert.equal(fleetQuotaEnabled(), true, 'env forces it on despite config off');
+    assert.equal(fleetQuotaCap(), 0.7, 'env cap overrides the config cap');
+  } finally {
+    delete process.env.TEAMCLAUDE_FLEET_QUOTA;
+    delete process.env.TEAMCLAUDE_FLEET_QUOTA_CAP;
+    setFleetQuotaConfig(null);
+  }
+});

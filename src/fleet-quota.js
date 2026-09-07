@@ -52,13 +52,21 @@ const WINDOW_MAP = [
   { name: 'seven_day_sonnet', u: 'unified7dSonnet', r: 'unified7dSonnetReset' },
 ];
 
+// Live config object (the same one reloadAccounts mutates), so this can be
+// switched on from ~/.config/teamclaude.json + POST /teamclaude/reload without
+// restarting the proxy — a restart tears every MITM tunnel at once, which is a
+// real cost to pay for flipping a boolean.
+let liveConfig = null;
+export function setFleetQuotaConfig(cfg) { liveConfig = cfg; }
+
 export function fleetQuotaEnabled() {
-  return process.env.TEAMCLAUDE_FLEET_QUOTA === '1';
+  if (process.env.TEAMCLAUDE_FLEET_QUOTA === '1') return true;
+  return liveConfig?.fleetQuota?.enabled === true;
 }
 
 /** Ceiling for reported utilization, or null when un-capped (the default). */
 export function fleetQuotaCap() {
-  const raw = process.env.TEAMCLAUDE_FLEET_QUOTA_CAP;
+  const raw = process.env.TEAMCLAUDE_FLEET_QUOTA_CAP ?? liveConfig?.fleetQuota?.cap;
   if (raw == null || raw === '') return null;
   const v = Number(raw);
   return Number.isFinite(v) && v > 0 && v <= 1 ? v : null;

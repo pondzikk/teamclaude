@@ -24,6 +24,7 @@ import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
+import { setFleetQuotaConfig } from './fleet-quota.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -270,6 +271,9 @@ async function serverCommand() {
   // POST /teamclaude/reload endpoint, and the CLI notify after add/change all
   // funnel through here. Returns the number of newly added accounts. Also picks
   // up a changed probe interval so `teamclaude probe` applies live.
+  // Hand the live config to the fleet-quota reader before any request lands.
+  setFleetQuotaConfig(config);
+
   const reloadAccounts = async () => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
@@ -285,6 +289,9 @@ async function serverCommand() {
       if (diskSxKey) await sx.configure(diskSxKey, diskSxMode);
       else { sx.disable(); await sx.setMode(diskSxMode); }
     }
+    // Fleet-level quota reporting is a plain on/off + cap, so a disk edit plus
+    // POST /teamclaude/reload applies it live — no restart, no torn tunnels.
+    config.fleetQuota = diskConfig.fleetQuota || null;
     if (prober) {
       const ms = (diskConfig.quotaProbeSeconds || 0) * 1000;
       if (ms !== prober.intervalMs) {
