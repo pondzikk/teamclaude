@@ -17,6 +17,7 @@ import { createEgressGuard } from './egress-guard.js';
 import { ModelHealth, isLocalFault } from './model-health.js';
 import { journalResponse, journalEnabled } from './quota-journal.js';
 import { startQuotaSnapshots } from './quota-snapshot.js';
+import { fleetQuotaEnabled, fleetQuota, rewriteQuotaHeaders, rewriteSSEEvent } from './fleet-quota.js';
 import {
   anthropicToOpenAIRequest, openAIToAnthropicResponse, openAIToAnthropicError,
   translateOpenAIStream, openAIChatCompletionsUrl,
@@ -1239,6 +1240,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.health?.recordSuccess(ctx.model);
     }
 
+    // Fleet-level quota reporting (see fleet-quota.js): the figures upstream
+    // sent describe the ONE account that answered. A client that throttles
+    // itself on them mistakes a single spent account for a spent pool. Report
+    // the headroom of the accounts that can actually serve the next request.
+    // null (nothing available) leaves the upstream numbers untouched.
+    const fq = fleetQuotaEnabled() ? fleetQuota(accountManager, ctx.model, ctx.advisorModel) : null;
+    if (fq) rewriteQuotaHeaders(responseHeaders, fq);
+
     res.writeHead(upstreamRes.status, responseHeaders);
 
     if (!upstreamRes.body) {
@@ -1266,7 +1275,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           onUsage: (u) => accountManager.updateUsage(account.index, u.input_tokens || 0, 0),
         })
         : upstreamRes.body;
-      await streamResponse(responseStream, res, account.index, accountManager, bw);
+      await streamResponse(responseStream, res, account.index, accountManager, bw, fq);
       l?.end();
     } else {
       let buf = Buffer.from(await upstreamRes.arrayBuffer());
@@ -1378,7 +1387,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, fq = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1393,13 +1402,15 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
 
-      // Forward chunk immediately
-      const ok = res.write(value);
-
-      // Append to the log as it streams (no whole-body buffering)
-      if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
-
       const text = decoder.decode(value, { stream: true });
+
+      // Without fleet-quota rewriting the chunk goes out untouched and
+      // immediately — the original byte-for-byte path, no added latency.
+      let ok = true;
+      if (!fq) {
+        ok = res.write(value);
+        if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
+      }
 
       // Parse SSE events for usage tracking
       sseBuffer += text;
@@ -1408,6 +1419,14 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
       for (const event of events) {
         parseSSEUsage(event, accountIndex, accountManager);
+        // Rewriting needs whole events, so with fq on we relay per complete
+        // event instead of per chunk: an incomplete trailing event waits in
+        // sseBuffer (flushed below) rather than going out unrewritten.
+        if (fq) {
+          const out = Buffer.from(rewriteSSEEvent(event, fq) + '\n\n', 'utf8');
+          ok = res.write(out);
+          if (bodyWriter) bodyWriter.chunk(out);
+        }
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1428,6 +1447,13 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
       parseSSEUsage(sseBuffer, accountIndex, accountManager);
+    }
+    // With rewriting on, a trailing partial event was never relayed — flush it
+    // verbatim so the stream still ends with every byte the upstream sent.
+    if (fq && sseBuffer.length && !res.destroyed) {
+      const tail = Buffer.from(sseBuffer, 'utf8');
+      res.write(tail);
+      if (bodyWriter) bodyWriter.chunk(tail);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
