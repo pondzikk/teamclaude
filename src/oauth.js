@@ -441,11 +441,16 @@ function startCallbackServer(expectedState) {
     });
     server.on('error', reject);
 
-    // Timeout after 2 minutes (unref so it doesn't keep the process alive)
+    // Timeout (unref so it doesn't keep the process alive). Two minutes is fine
+    // when you authorise in your own browser, but not when the person who owns the
+    // account is at another machine: you send them the URL, they log in, and they
+    // send the callback back — that round trip is human-paced. Overridable so a
+    // remote hand-off does not have to race a stopwatch.
+    const timeoutMs = Number(process.env.TEAMCLAUDE_LOGIN_TIMEOUT_MS) || 120_000;
     const timer = setTimeout(() => {
-      rejectCode(new Error('Login timed out after 2 minutes'));
+      rejectCode(new Error(`Login timed out after ${Math.round(timeoutMs / 1000)}s`));
       server.close();
-    }, 120_000);
+    }, timeoutMs);
     timer.unref();
   });
 }
