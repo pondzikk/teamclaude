@@ -160,7 +160,7 @@ export function anthropicToOpenAIRequest(input, { includeUsage = true } = {}) {
     const tools = [];
     for (const t of src.tools) {
       if (!t || !t.name) continue;
-      const fn = { name: t.name, parameters: t.input_schema || { type: 'object', properties: {} } };
+      const fn = { name: t.name, parameters: sanitizeSchemaForPython(t.input_schema || { type: 'object', properties: {} }) };
       if (t.description) fn.description = t.description;
       tools.push({ type: 'function', function: fn });
     }
@@ -245,6 +245,66 @@ export function openAIToAnthropicResponse(oai, model) {
  * Translate an OpenAI-shaped error body into an Anthropic error body, so a
  * failing upstream still produces something Claude Code can render.
  */
+/**
+ * JSON Schema regexes that Python's `re` cannot compile.
+ *
+ * OpenAI-compatible servers built on Python (sglang, vLLM) validate every tool's
+ * `parameters` against the JSON Schema metaschema, which requires each `pattern`
+ * to be format "regex" — checked with Python's own engine. Claude Code ships
+ * JavaScript regexes, and a single incompatible one fails the WHOLE request:
+ *
+ *   Tool 1 function has invalid 'parameters' schema:
+ *   '^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$' is not a 'regex'
+ *
+ * The conversation then 400s before the model sees anything. Dropping the offending
+ * `pattern` costs nothing that matters — it is an advisory constraint models do not
+ * enforce anyway — while keeping it costs the entire session.
+ *
+ * Deliberately narrow: only constructs Python genuinely lacks. Lookbehind is NOT
+ * listed, because Python supports (?<= and (?<!; only JS-style named groups (?<name>
+ * differ, Python spelling them (?P<name>.
+ */
+const PY_INCOMPATIBLE_REGEX = [
+  /\\[pP]\{/,        // \p{Cc} Unicode property escapes — the observed breakage
+  /\(\?<[^=!]/,       // (?<name>  JS named group; Python needs (?P<name>
+  /\\[hRX]/,          // \h \R \X — PCRE, absent from Python re
+  /[*+?}]\+/,          // possessive quantifiers a*+ a++ a{2,}+
+];
+
+function regexPortableToPython(pattern) {
+  return typeof pattern === 'string' && !PY_INCOMPATIBLE_REGEX.some(re => re.test(pattern));
+}
+
+/**
+ * Deep copy of a JSON Schema with every non-portable `pattern` removed (and any
+ * `patternProperties` key whose regex is non-portable dropped along with its
+ * subschema). Returns the input untouched when nothing needed changing, so the
+ * common case allocates nothing.
+ */
+export function sanitizeSchemaForPython(schema) {
+  let changed = false;
+  const walk = (node) => {
+    if (Array.isArray(node)) return node.map(walk);
+    if (!node || typeof node !== 'object') return node;
+    const out = {};
+    for (const [k, v] of Object.entries(node)) {
+      if (k === 'pattern' && !regexPortableToPython(v)) { changed = true; continue; }
+      if (k === 'patternProperties' && v && typeof v === 'object') {
+        const kept = {};
+        for (const [rx, sub] of Object.entries(v)) {
+          if (regexPortableToPython(rx)) kept[rx] = walk(sub); else changed = true;
+        }
+        if (Object.keys(kept).length) out[k] = kept;
+        continue;
+      }
+      out[k] = walk(v);
+    }
+    return out;
+  };
+  const result = walk(schema);
+  return changed ? result : schema;
+}
+
 export function openAIToAnthropicError(oai) {
   const err = oai?.error || {};
   // Two shapes in the wild. OpenAI nests: {"error":{"message","type"}}. sglang and

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { openAIToAnthropicError } from '../src/openai-translate.js';
+import { openAIToAnthropicError, sanitizeSchemaForPython, anthropicToOpenAIRequest } from '../src/openai-translate.js';
 
 // End-to-end cover for `protocol: "openai"` accounts (OpenCode Zen's kimi/glm/
 // qwen/deepseek models): Claude Code speaks Anthropic /v1/messages to the proxy,
@@ -334,4 +334,59 @@ test('an unparseable body still yields a renderable error', () => {
   assert.equal(openAIToAnthropicError('plain text boom').error.message, 'plain text boom');
   assert.equal(openAIToAnthropicError(null).error.message, 'upstream error');
   assert.equal(openAIToAnthropicError({}).error.type, 'api_error');
+});
+
+// --- tool schemas: JS regexes that Python's jsonschema rejects ---------------
+
+// Verbatim from a real Claude Code tool schema; sglang answered 400 for the whole
+// request ("is not a 'regex'"), so the model never saw the conversation at all.
+const JS_ONLY = '^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}"\\\\./[\\]]{1,200}$';
+
+test('a Unicode-property pattern is dropped, a portable one is kept', () => {
+  const out = sanitizeSchemaForPython({
+    type: 'object',
+    properties: {
+      bad: { type: 'string', pattern: JS_ONLY },
+      good: { type: 'string', pattern: '^[a-z0-9_-]+$' },
+      deep: { type: 'object', properties: { alsoBad: { type: 'string', pattern: JS_ONLY } } },
+    },
+  });
+  assert.equal(out.properties.bad.pattern, undefined, 'the offending pattern must go');
+  assert.equal(out.properties.good.pattern, '^[a-z0-9_-]+$', 'portable patterns survive');
+  assert.equal(out.properties.deep.properties.alsoBad.pattern, undefined, 'nested too');
+  assert.equal(out.properties.bad.type, 'string', 'everything else is preserved');
+});
+
+test('patternProperties keys are filtered by the same rule', () => {
+  const out = sanitizeSchemaForPython({
+    type: 'object',
+    patternProperties: { '^x-\\p{L}+$': { type: 'string' }, '^ok-[a-z]+$': { type: 'number' } },
+  });
+  assert.deepEqual(Object.keys(out.patternProperties), ['^ok-[a-z]+$']);
+});
+
+test('only genuinely non-portable constructs are stripped', () => {
+  const keep = ['^[a-z]+$', '^(?<=x)y', '^(?!bad)ok$', '\\d{1,3}', '(?i)nope'];
+  for (const pattern of keep) {
+    assert.equal(sanitizeSchemaForPython({ type: 'string', pattern }).pattern, pattern, pattern);
+  }
+  for (const pattern of [JS_ONLY, '(?<name>a)', 'a\\h b', 'x*+']) {
+    assert.equal(sanitizeSchemaForPython({ type: 'string', pattern }).pattern, undefined, pattern);
+  }
+});
+
+test('a clean schema is returned untouched (same object, no needless copy)', () => {
+  const clean = { type: 'object', properties: { a: { type: 'string', pattern: '^a+$' } } };
+  assert.equal(sanitizeSchemaForPython(clean), clean);
+});
+
+test('tool translation applies the sanitizer, so the request can actually be sent', () => {
+  const oai = anthropicToOpenAIRequest(Buffer.from(JSON.stringify({
+    model: 'm', max_tokens: 10,
+    tools: [{ name: 'Artifact', input_schema: { type: 'object', properties: { field: { type: 'string', pattern: JS_ONLY } } } }],
+    messages: [{ role: 'user', content: 'hi' }],
+  })));
+  assert.equal(oai.tools[0].function.name, 'Artifact');
+  assert.equal(oai.tools[0].function.parameters.properties.field.pattern, undefined,
+    'the pattern that 400s a Python-based server must not be forwarded');
 });
