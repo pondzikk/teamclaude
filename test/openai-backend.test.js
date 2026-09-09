@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
+import { openAIToAnthropicError } from '../src/openai-translate.js';
 
 // End-to-end cover for `protocol: "openai"` accounts (OpenCode Zen's kimi/glm/
 // qwen/deepseek models): Claude Code speaks Anthropic /v1/messages to the proxy,
@@ -298,4 +299,39 @@ test('an account without `protocol` still speaks Anthropic to its upstream', asy
     proxy.close();
     upstream.close();
   }
+});
+
+// --- error shapes: OpenAI nests, sglang/vLLM do not --------------------------
+
+test('error translation reads the sglang/vLLM top-level shape, not just OpenAI nesting', () => {
+  // Verbatim from sglang 0.0.0.dev1 — no `error` wrapper anywhere.
+  const sglang = {
+    object: 'error',
+    message: 'max_completion_tokens is too large: 9999999. This model supports at most 524288 completion tokens.',
+    type: 'BadRequestError', param: null, code: 400,
+  };
+  const out = openAIToAnthropicError(sglang);
+  assert.equal(out.type, 'error');
+  assert.match(out.error.message, /max_completion_tokens is too large/,
+    'the real reason must reach the user, not "upstream error"');
+  assert.equal(out.error.type, 'invalid_request_error', 'code 400 → a type Anthropic clients understand');
+});
+
+test('the OpenAI nested shape still wins where present', () => {
+  const openai = { error: { message: 'bad key', type: 'authentication_error' } };
+  const out = openAIToAnthropicError(openai);
+  assert.equal(out.error.message, 'bad key');
+  assert.equal(out.error.type, 'authentication_error');
+});
+
+test('status code drives the type when the upstream names none', () => {
+  for (const [code, want] of [[429, 'rate_limit_error'], [401, 'authentication_error'], [503, 'api_error'], [400, 'invalid_request_error']]) {
+    assert.equal(openAIToAnthropicError({ object: 'error', message: 'x', code }).error.type, want, `code ${code}`);
+  }
+});
+
+test('an unparseable body still yields a renderable error', () => {
+  assert.equal(openAIToAnthropicError('plain text boom').error.message, 'plain text boom');
+  assert.equal(openAIToAnthropicError(null).error.message, 'upstream error');
+  assert.equal(openAIToAnthropicError({}).error.type, 'api_error');
 });

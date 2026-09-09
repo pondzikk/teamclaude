@@ -247,13 +247,27 @@ export function openAIToAnthropicResponse(oai, model) {
  */
 export function openAIToAnthropicError(oai) {
   const err = oai?.error || {};
-  return {
-    type: 'error',
-    error: {
-      type: err.type || 'api_error',
-      message: err.message || (typeof oai === 'string' ? oai : 'upstream error'),
-    },
-  };
+  // Two shapes in the wild. OpenAI nests: {"error":{"message","type"}}. sglang and
+  // vLLM do NOT — they answer {"object":"error","message":"…","type":"BadRequestError",
+  // "code":400} with everything at the TOP level. Reading only err.message turned
+  // every one of those into a bare "upstream error", which is exactly the string a
+  // user sees instead of the real reason (measured against sglang 0.0.0.dev1).
+  const message = err.message
+    ?? (typeof oai?.message === 'string' ? oai.message : null)
+    ?? (typeof oai === 'string' ? oai : 'upstream error');
+
+  // Keep the type within the set Anthropic clients branch on — an unknown string
+  // like "BadRequestError" can defeat their retry logic. Derive it from the status
+  // code when the upstream gives one, else fall back to the nested type.
+  const code = Number(oai?.code ?? err.code);
+  const type = err.type
+    ?? (code >= 500 ? 'api_error'
+      : code === 429 ? 'rate_limit_error'
+        : code === 401 || code === 403 ? 'authentication_error'
+          : code >= 400 ? 'invalid_request_error'
+            : 'api_error');
+
+  return { type: 'error', error: { type, message } };
 }
 
 function sse(event, data) {
