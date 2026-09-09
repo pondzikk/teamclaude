@@ -79,7 +79,7 @@ function imageBlockToPart(block) {
  * anthropic_version, top_k, …) are dropped — third-party OpenAI-compatible
  * backends reject unknown fields with a 400.
  */
-export function anthropicToOpenAIRequest(input, { includeUsage = true } = {}) {
+export function anthropicToOpenAIRequest(input, { includeUsage = true, chatTemplateEffort = false } = {}) {
   const src = (Buffer.isBuffer(input) || typeof input === 'string')
     ? JSON.parse(input.toString('utf8'))
     : input;
@@ -154,6 +154,14 @@ export function anthropicToOpenAIRequest(input, { includeUsage = true } = {}) {
     } else if (parts.length) {
       out.messages.push({ role: 'user', content: hasImage ? parts : textOnly });
     }
+  }
+
+  // Effort → reasoning budget, only for backends that speak chat_template_kwargs
+  // (an sglang/vLLM extension; OpenAI proper rejects unknown top-level params, so
+  // this stays behind an explicit per-account opt-in).
+  if (chatTemplateEffort) {
+    const reasoning = effortToReasoningEffort(src.output_config?.effort);
+    if (reasoning) out.chat_template_kwargs = { ...(out.chat_template_kwargs || {}), reasoning_effort: reasoning };
   }
 
   if (Array.isArray(src.tools) && src.tools.length) {
@@ -303,6 +311,30 @@ export function sanitizeSchemaForPython(schema) {
   };
   const result = walk(schema);
   return changed ? result : schema;
+}
+
+/**
+ * Claude Code's effort → the reasoning budget a Qwen3-style chat template understands.
+ *
+ * Claude Code sends `output_config: {"effort":"low"|"medium"|"high"|…}` (beta
+ * effort-2025-11-24) and `thinking: {"type":"adaptive"}`; it does NOT send
+ * budget_tokens. sglang/vLLM take the knob as `chat_template_kwargs.reasoning_effort`.
+ *
+ * Everything above "high" is folded down to "high" on purpose. sglang does not
+ * reject an unknown value — it silently drops the directive, and the model then
+ * thinks LESS, not more: measured on Qwen3.8-Flash-Next, low/medium/high produced
+ * 86/99/113 reasoning tokens while "xhigh"/"ultra" produced 27/35. Passing Claude
+ * Code's higher tiers through verbatim would quietly do the opposite of what the
+ * user asked for.
+ */
+const EFFORT_TO_REASONING = {
+  low: 'low', medium: 'medium', high: 'high',
+  xhigh: 'high', max: 'high', ultra: 'high',
+};
+
+export function effortToReasoningEffort(effort) {
+  if (typeof effort !== 'string') return null;
+  return EFFORT_TO_REASONING[effort.trim().toLowerCase()] ?? null;
 }
 
 export function openAIToAnthropicError(oai) {

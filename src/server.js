@@ -981,7 +981,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   let openAIModel = null;
   if (translateOpenAI) {
     try {
-      const oaiReq = anthropicToOpenAIRequest(sendBody, { includeUsage: account.streamUsage !== false });
+      const oaiReq = anthropicToOpenAIRequest(sendBody, {
+        includeUsage: account.streamUsage !== false,
+        chatTemplateEffort: account.chatTemplateEffort === true,
+      });
       openAIModel = oaiReq.model;
       sendBody = Buffer.from(JSON.stringify(oaiReq), 'utf8');
       headers['content-type'] = 'application/json';

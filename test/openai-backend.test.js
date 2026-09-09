@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { openAIToAnthropicError, sanitizeSchemaForPython, anthropicToOpenAIRequest } from '../src/openai-translate.js';
+import { openAIToAnthropicError, sanitizeSchemaForPython, anthropicToOpenAIRequest, effortToReasoningEffort } from '../src/openai-translate.js';
 
 // End-to-end cover for `protocol: "openai"` accounts (OpenCode Zen's kimi/glm/
 // qwen/deepseek models): Claude Code speaks Anthropic /v1/messages to the proxy,
@@ -389,4 +389,46 @@ test('tool translation applies the sanitizer, so the request can actually be sen
   assert.equal(oai.tools[0].function.name, 'Artifact');
   assert.equal(oai.tools[0].function.parameters.properties.field.pattern, undefined,
     'the pattern that 400s a Python-based server must not be forwarded');
+});
+
+// --- effort → reasoning_effort (sglang/vLLM chat_template_kwargs) -------------
+
+function withEffort(effort, opts) {
+  return anthropicToOpenAIRequest(Buffer.from(JSON.stringify({
+    model: 'm', max_tokens: 10,
+    ...(effort ? { output_config: { effort } } : {}),
+    messages: [{ role: 'user', content: 'hi' }],
+  })), opts);
+}
+
+test('tiers above high fold down to high, never through verbatim', () => {
+  // sglang does not reject an unknown value, it drops the directive — and the model
+  // then thinks LESS: measured 86/99/113 tokens for low/medium/high vs 27/35 for
+  // "xhigh"/"ultra". Passing them through would invert the user's intent.
+  assert.equal(effortToReasoningEffort('low'), 'low');
+  assert.equal(effortToReasoningEffort('medium'), 'medium');
+  for (const e of ['high', 'xhigh', 'max', 'ultra', 'HIGH', ' Max ']) {
+    assert.equal(effortToReasoningEffort(e), 'high', e);
+  }
+  for (const e of ['', 'nonsense', null, undefined, 7]) {
+    assert.equal(effortToReasoningEffort(e), null, String(e));
+  }
+});
+
+test('opt-in only: without the account flag nothing is added', () => {
+  const out = withEffort('high', {});
+  assert.equal(out.chat_template_kwargs, undefined,
+    'OpenAI proper rejects unknown top-level params — never send this uninvited');
+});
+
+test('with the flag, Claude Code effort becomes reasoning_effort', () => {
+  assert.deepEqual(withEffort('low', { chatTemplateEffort: true }).chat_template_kwargs,
+    { reasoning_effort: 'low' });
+  assert.deepEqual(withEffort('xhigh', { chatTemplateEffort: true }).chat_template_kwargs,
+    { reasoning_effort: 'high' });
+});
+
+test('no effort in the request leaves the server default alone', () => {
+  assert.equal(withEffort(null, { chatTemplateEffort: true }).chat_template_kwargs, undefined);
+  assert.equal(withEffort('nonsense', { chatTemplateEffort: true }).chat_template_kwargs, undefined);
 });
