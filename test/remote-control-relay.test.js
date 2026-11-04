@@ -56,6 +56,30 @@ test('a GET to /v1/code/* forwards the client credential and streams the respons
   }
 });
 
+// Remote Control registers its bridge (/v1/environments/...) and creates its
+// sessions (/v1/sessions) on the client's identity too; a fleet token there gets
+// a 404 and /rc never starts.
+for (const path of ['/v1/environments/bridge', '/v1/environments/env_1/work/poll?beta=true', '/v1/sessions?beta=true']) {
+  test(`${path} forwards the client credential`, async () => {
+    const { server: upstream, port: upstreamPort } = await listen((req, res) => {
+      assert.equal(req.headers.authorization, 'Bearer client-own-token');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    try {
+      const accountManager = { getActiveAccount() { throw new Error('must not rotate Remote Control'); } };
+      const listener = createProxyRequestListener({ accountManager, upstream: `http://127.0.0.1:${upstreamPort}` });
+      const { status, text } = await requestThrough(listener, {
+        method: 'POST', path, headers: { authorization: 'Bearer client-own-token' }, body: '{}',
+      });
+      assert.equal(status, 200);
+      assert.equal(text, '{"ok":true}');
+    } finally {
+      upstream.close();
+    }
+  });
+}
+
 // The whole point of the rewrite: relayStream must not wait for the request (or
 // the response) to fully materialize before starting to move bytes — a
 // long-poll upstream that waits before sending headers must not be treated as

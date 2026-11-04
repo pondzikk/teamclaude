@@ -375,7 +375,10 @@ export function relayHttpForward(req, res) {
 // different account than the one you're logged in as"), Remote Control binds to
 // the wrong account, and artifacts get published under it. Observed on a live
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
+// Remote Control registers its bridge and its sessions under /v1/environments/
+// and /v1/sessions: with a fleet token there upstream answers 404 and /rc never
+// comes up.
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/v1/environments', '/v1/sessions'];
 
 /**
  * Build the core proxy request listener — buffer the body, then forward with
