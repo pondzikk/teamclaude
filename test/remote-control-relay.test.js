@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { once } from 'node:events';
-import { createProxyRequestListener, relayUpgrade } from '../src/server.js';
+import { createProxyRequestListener, relayUpgrade, usesClientIdentity } from '../src/server.js';
 
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
 async function listen(handler) {
@@ -60,7 +60,9 @@ test('a GET to /v1/code/* forwards the client credential and streams the respons
 // sessions (/v1/sessions) on the client's identity too; a fleet token there gets
 // a 404 and /rc never starts. Feature flags (/api/eval/) are evaluated for the
 // credential's account, so a fleet token there switches /rc off entirely.
-for (const path of ['/v1/environments/bridge', '/v1/environments/env_1/work/poll?beta=true', '/v1/sessions?beta=true', '/api/eval/sdk-test']) {
+// Artifacts, Pages and designs publish under the client's own account.
+for (const path of ['/v1/environments/bridge', '/v1/environments/env_1/work/poll?beta=true', '/v1/sessions?beta=true', '/api/eval/sdk-test',
+  '/api/artifacts/mcp', '/api/artifacts/mcp/upload/x', '/v1/pages/mcp', '/v1/design/mcp']) {
   test(`${path} forwards the client credential`, async () => {
     const { server: upstream, port: upstreamPort } = await listen((req, res) => {
       assert.equal(req.headers.authorization, 'Bearer client-own-token');
@@ -214,6 +216,41 @@ test('an upstream socket that dies mid-relay tears down the pair instead of cras
     clearInterval(writer);
     client.destroy();
     proxy.close();
+    upstream.close();
+  }
+});
+
+test('only inference rotates when the client carries its own OAuth token', () => {
+  const oat = { authorization: 'Bearer sk-ant-oat01-abc' };
+  const own = (url, headers = oat) => usesClientIdentity({ url, headers });
+  assert.equal(own('/api/claude_code_shared_session_transcripts'), true);
+  assert.equal(own('/api/frame/deploy/direct'), true);
+  assert.equal(own('/v1/code/sessions/x/teleport-events?a=1'), true);
+  assert.equal(own('/v1/messages?beta=true'), false);
+  assert.equal(own('/v1/messages/count_tokens?beta=true'), false);
+  assert.equal(own('/v1/models'), false);
+  assert.equal(own('/v1/complete'), false);
+  assert.equal(own('/tc-acct/pondzik/v1/files'), false);
+  // No OAuth token (proxy API key, or none): the old rotation applies.
+  assert.equal(own('/api/claude_code/skills', { authorization: 'Bearer proxy-key' }), false);
+  assert.equal(own('/api/claude_code/skills', {}), false);
+});
+
+test('a non-inference call with an OAuth token reaches upstream with that token', async () => {
+  const { server: upstream, port: upstreamPort } = await listen((req, res) => {
+    assert.equal(req.headers.authorization, 'Bearer sk-ant-oat01-own');
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"transcript":true}');
+  });
+  try {
+    const accountManager = { getActiveAccount() { throw new Error('must not rotate'); } };
+    const listener = createProxyRequestListener({ accountManager, upstream: `http://127.0.0.1:${upstreamPort}` });
+    const { status, text } = await requestThrough(listener, {
+      path: '/api/claude_code_shared_session_transcripts', headers: { authorization: 'Bearer sk-ant-oat01-own' },
+    });
+    assert.equal(status, 200);
+    assert.equal(text, '{"transcript":true}');
+  } finally {
     upstream.close();
   }
 });

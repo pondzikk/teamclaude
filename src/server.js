@@ -400,8 +400,24 @@ export function relayHttpForward(req, res) {
 // and /v1/sessions: with a fleet token there upstream answers 404 and /rc never
 // comes up. Feature flags (/api/eval/<clientKey>) are evaluated for whoever the
 // credential names; with a fleet token the client gets that account's flags,
-// and the one gating /rc (tengu_ccr_bridge) comes back off.
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/v1/environments', '/v1/sessions', '/api/eval/'];
+// and the one gating /rc (tengu_ccr_bridge) comes back off. Artifacts, Pages and
+// designs are MCP servers published under the client's own claude.ai account.
+const CLIENT_CREDENTIAL_PATHS = [
+  '/v1/code/', '/api/oauth/', '/v1/environments', '/v1/sessions', '/api/eval/',
+  '/api/artifacts/', '/v1/pages/', '/v1/design/',
+];
+
+// The only requests the fleet serves: inference and model listing. Pinned
+// (`/tc-acct/...`) and control paths never reach the identity check below.
+const ROTATED_PATHS = ['/v1/messages', '/v1/complete', '/v1/models'];
+
+/** A non-inference API call from a client carrying its own claude.ai OAuth token. */
+export function usesClientIdentity(req) {
+  const url = req.url || '';
+  if (!url.startsWith('/v1/') && !url.startsWith('/api/')) return false;
+  if (ROTATED_PATHS.some((p) => url === p || url.startsWith(`${p}?`) || url.startsWith(`${p}/`))) return false;
+  return /^Bearer sk-ant-oat/i.test(String(req.headers?.authorization || ''));
+}
 
 /**
  * Build the core proxy request listener — buffer the body, then forward with
@@ -460,6 +476,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // paired identity, so fetching them with a rotated token 403s and Claude
       // Code silently drops the image from the message.
       if (CLIENT_CREDENTIAL_PATHS.some((p) => (req.url || '').startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
+      // Beyond that list: a client logged in to claude.ai (MITM mode) sends its
+      // own OAuth token, and everything it calls besides inference — session
+      // transcripts and resume, artifact frames, skills, settings, and endpoints
+      // Claude Code has yet to add — belongs to that identity. Rotating those
+      // was a whack-a-mole of wrong-account breakage, so only inference rotates.
+      if (usesClientIdentity(req)) { await relayStream(req, res, upstream, sx); return; }
 
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
