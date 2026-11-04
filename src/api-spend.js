@@ -135,5 +135,11 @@ export class SpendLedger {
  */
 export function isCreditExhausted(status, bodyText) {
   if (status === 402) return true;
-  return status === 400 && /credit balance is too low|billing_error/i.test(bodyText || '');
+  if (status !== 400) return false;
+  // Match the structured error only: a 400 can echo client-supplied text, and a
+  // loose match on the raw body would let a request bench the account for a month.
+  let err;
+  try { err = JSON.parse(bodyText || '')?.error; } catch { return false; }
+  return err?.type === 'billing_error'
+    || (typeof err?.message === 'string' && err.message.startsWith('Your credit balance is too low'));
 }

@@ -50,6 +50,10 @@ test('isCreditExhausted recognises 402 and the 400 credit-balance message only',
   assert.equal(isCreditExhausted(400, '{"error":{"message":"Your credit balance is too low to access the Anthropic API."}}'), true);
   assert.equal(isCreditExhausted(400, '{"error":{"message":"messages: field required"}}'), false);
   assert.equal(isCreditExhausted(500, 'credit balance is too low'), false);
+  assert.equal(isCreditExhausted(400, '{"type":"error","error":{"type":"billing_error","message":"x"}}'), true);
+  // Client text echoed back inside an ordinary validation error must not count.
+  assert.equal(isCreditExhausted(400, '{"error":{"type":"invalid_request_error","message":"bad value: Your credit balance is too low"}}'), false);
+  assert.equal(isCreditExhausted(400, 'credit balance is too low'), false);
 });
 
 test('ledger keeps a per-month total and persists it', () => {

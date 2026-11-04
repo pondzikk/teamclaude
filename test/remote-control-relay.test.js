@@ -58,8 +58,9 @@ test('a GET to /v1/code/* forwards the client credential and streams the respons
 
 // Remote Control registers its bridge (/v1/environments/...) and creates its
 // sessions (/v1/sessions) on the client's identity too; a fleet token there gets
-// a 404 and /rc never starts.
-for (const path of ['/v1/environments/bridge', '/v1/environments/env_1/work/poll?beta=true', '/v1/sessions?beta=true']) {
+// a 404 and /rc never starts. Feature flags (/api/eval/) are evaluated for the
+// credential's account, so a fleet token there switches /rc off entirely.
+for (const path of ['/v1/environments/bridge', '/v1/environments/env_1/work/poll?beta=true', '/v1/sessions?beta=true', '/api/eval/sdk-test']) {
   test(`${path} forwards the client credential`, async () => {
     const { server: upstream, port: upstreamPort } = await listen((req, res) => {
       assert.equal(req.headers.authorization, 'Bearer client-own-token');

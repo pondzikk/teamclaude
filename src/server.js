@@ -398,8 +398,10 @@ export function relayHttpForward(req, res) {
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
 // Remote Control registers its bridge and its sessions under /v1/environments/
 // and /v1/sessions: with a fleet token there upstream answers 404 and /rc never
-// comes up.
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/v1/environments', '/v1/sessions'];
+// comes up. Feature flags (/api/eval/<clientKey>) are evaluated for whoever the
+// credential names; with a fleet token the client gets that account's flags,
+// and the one gating /rc (tengu_ccr_bridge) comes back off.
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/v1/environments', '/v1/sessions', '/api/eval/'];
 
 /**
  * Build the core proxy request listener — buffer the body, then forward with
