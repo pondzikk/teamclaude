@@ -1,3 +1,4 @@
+import { SpendLedger, costOf, nextMonthStart } from './api-spend.js';
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, isFableModel } from './model.js';
@@ -42,6 +43,43 @@ function emptyQuota() {
   };
 }
 
+/**
+ * Per-account hard ceiling on the subscription buckets, from config
+ * `maxUtilization: { fiveHour, weekly }` as fractions (e.g. 0.8). Meant for an
+ * account lent by someone else ("never take more than 80% of her 5h window"):
+ * unlike switchThreshold it is never crossed on purpose — see isOverHardCap.
+ * Values may be fractions (0.8) or percentages (80). It FAILS CLOSED: a cap
+ * that is present but unreadable (typo'd key, bad value) blocks the account
+ * with { invalid: true } instead of silently leaving it uncapped.
+ */
+const CAP_KEYS = { fiveHour: 'fiveHour', five_hour: 'fiveHour', '5h': 'fiveHour', weekly: 'weekly', seven_day: 'weekly', '7d': 'weekly' };
+
+export function normalizeCap(cap, name = '?') {
+  if (cap == null) return null;
+  const invalid = (why) => {
+    console.error(`[TeamClaude] maxUtilization on "${name}" is invalid (${why}) — the account is BLOCKED until it is fixed. Expected e.g. {"fiveHour":0.8,"weekly":0.85}`);
+    return { invalid: true };
+  };
+  if (typeof cap !== 'object' || Array.isArray(cap)) return invalid(`got ${JSON.stringify(cap)}`);
+  const out = {};
+  for (const [k, raw] of Object.entries(cap)) {
+    const key = CAP_KEYS[k];
+    if (!key) return invalid(`unknown key "${k}"`);
+    let v = Number(raw);
+    if (Number.isFinite(v) && v > 1 && v <= 100) v /= 100; // 80 means 80%
+    if (!(Number.isFinite(v) && v > 0 && v <= 1)) return invalid(`${k}=${JSON.stringify(raw)}`);
+    out[key] = v;
+  }
+  return Object.keys(out).length ? out : invalid('no limit given');
+}
+
+function budgetOf(acct) {
+  const v = Number(acct.monthlyBudget);
+  return acct.type === 'apikey' && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+const pct = (v) => (v == null ? '?' : `${Math.round(v * 100)}%`);
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -56,6 +94,11 @@ function makeAccount(acct, index) {
     orgName: acct.orgName || null,
     priority: acct.priority || 0,
     disabled: acct.disabled || false,
+    maxUtilization: normalizeCap(acct.maxUtilization, acct.name),
+    // Fallback-only (e.g. an account lent by someone else): never chosen by
+    // automatic selection while any non-fallback account can serve the request.
+    // See _fallbackHeld. Explicit pins still reach it.
+    fallbackOnly: acct.fallbackOnly === true,
     upstream: acct.upstream || null,
     // Wire protocol the upstream speaks. 'openai' routes this account's
     // /v1/messages traffic through the Chat Completions translator
@@ -70,6 +113,14 @@ function makeAccount(acct, index) {
     // that reject e.g. `context_management`). See server.js stripBodyFields.
     stripRequestFields: acct.stripRequestFields || null,
     models: acct.models || null,
+    // Alternative quota source for a backend that reports none of its own.
+    // 'kimi' reads the web console gateway (src/kimi-quota.js) using webToken;
+    // null (the default) means quota comes from response headers as usual.
+    quotaProvider: acct.quotaProvider || null,
+    webToken: acct.webToken || null,
+    // Monthly USD credit of a pay-as-you-go API key account (src/api-spend.js).
+    // The proxy's own spend estimate against it drives the weekly bucket.
+    monthlyBudget: budgetOf(acct),
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
@@ -137,14 +188,22 @@ function sampleModelFor(route) {
   return route.match[0].replace(/\*/g, '') || 'model';
 }
 
+// Same upstream backend: both native Anthropic (no `upstream`), or the same
+// third-party upstream speaking the same protocol.
+function sameBackend(a, b) {
+  return (a.upstream || null) === (b.upstream || null) && (a.protocol || null) === (b.protocol || null);
+}
+
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, affinity, reserveFableAccounts, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, affinity, reserveFableAccounts, distributeSessions = false, sessionTracker, spendLedger } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
+    this.spendLedger = spendLedger || new SpendLedger();
+    for (const a of this.accounts) this._applySpend(a);
     this.currentIndex = 0;
     // Session awareness (issue #109). The tracker is always on (passive — it just
     // observes the x-claude-code-session-id header for the status readout).
@@ -309,11 +368,71 @@ export class AccountManager {
    */
   _effectivePriority(account, model, now, overloaded) {
     const resetAt = this._governingWeeklyReset(account, model);
+    // A fallback-only account is never demoted into the drain-first tier — it
+    // is held back entirely while own accounts can serve (see _fallbackHeld),
+    // and once they cannot its configured priority is all that matters.
+    if (account.fallbackOnly) return { prio: account.priority || 0, resetAt };
     let prio = (this.affinity.expiryHours > 0 && resetAt
       && resetAt - now <= this.affinity.expiryHours * 3600_000) ? 0 : (account.priority || 0);
     const keep = this.affinity.flattenKeepPriority;
     if (overloaded && (keep == null || prio < keep)) prio = 0;
     return { prio, resetAt };
+  }
+
+  /**
+   * The fallback-only gate, shared by EVERY automatic selection path: true when
+   * `account` is fallbackOnly and at least one non-fallback account can serve
+   * this request right now — available for `model` under the usual _isAvailable
+   * rules (status, quota/switchThreshold, hard cap, route membership) and not in
+   * the request's `exclude` set. Only once every own account is unusable does a
+   * fallback-only account become eligible, and then still subject to its own
+   * hard cap. Explicit pins never consult this.
+   *
+   * Decided on the EXECUTOR model only. An own account that can serve the
+   * executor but has no headroom in the advisor's family bucket still holds the
+   * fallback account back: the request takes the usual advisor degrade on the
+   * own account (losing at most the advisor sub-call) instead of moving the
+   * whole session — and its shared quota — onto a lent account. Only an own
+   * account over its HARD cap for the advisor is treated as unusable, exactly
+   * as the advisor-degrade passes do (_withAdvisorCapExcluded).
+   *
+   * With no model (status/eligibility, the switch endpoint, session-reset
+   * switching) route membership cannot be checked, so only own accounts on the
+   * same backend count — a kimi/OpenAI-protocol account never holds back a
+   * native Claude account.
+   */
+  _fallbackHeld(account, model = null, advisorModel = null, exclude = null) {
+    if (!account?.fallbackOnly) return false;
+    const skip = this._withAdvisorCapExcluded(exclude, advisorModel);
+    return this.accounts.some(a => !a.fallbackOnly && !skip?.has(a.index)
+      && (model || sameBackend(a, account))
+      && this._isAvailable(a, model));
+  }
+
+  /** Whether `account` can take an automatic request for `model` right now
+   * (status, holds, quota/switchThreshold, hard cap, route membership). */
+  isUsable(account, model = null) {
+    return this._isAvailable(account, model);
+  }
+
+  /** Whether a request already headed to `account` should give it up for an
+   * own account that became usable meanwhile (e.g. while it waited in admit()).
+   * False when `account` is the operator's manual route pin for this model —
+   * the pin is an explicit choice and re-selection would return it anyway. */
+  shouldLeaveFallback(account, model = null, advisorModel = null, exclude = null) {
+    if (!account?.fallbackOnly) return false;
+    if (this._pinnedAccountForModel(model, advisorModel)?.index === account.index) return false;
+    return this._fallbackHeld(account, model, advisorModel, exclude);
+  }
+
+  /** Toggle `fallbackOnly` at runtime (config hot reload). Returns true when it
+   * changed. */
+  setFallbackOnly(accountIndex, on) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.fallbackOnly === !!on) return false;
+    account.fallbackOnly = !!on;
+    console.log(`[TeamClaude] "${account.name}" is ${on ? 'now fallback-only (used only once every own account is unusable)' : 'no longer fallback-only'}`);
+    return true;
   }
 
   /** Drop session bindings idle past the TTL. */
@@ -387,11 +506,17 @@ export class AccountManager {
     }
 
     const bound = this.sessions.get(sessionId);
+    let heldBack = false;
     if (bound) {
       const acct = this.accounts[bound.index];
       if (acct) {
         const excluded = exclude?.has(acct.index);
-        if (!excluded && this._isAvailable(acct, model, advisorModel)) {
+        // Fallback-only bound account: as soon as an own account can serve this
+        // request (executor-wise — the same set the advisor-degrade pass below
+        // would choose from), the session moves back for good: rebind, never
+        // stay or detour. One cold cache read beats draining a lent account.
+        heldBack = this._fallbackHeld(acct, model, advisorModel, exclude);
+        if (!excluded && !heldBack && this._isAvailable(acct, model, advisorModel)) {
           bound.lastSeen = Date.now();
           return acct;
         }
@@ -399,7 +524,7 @@ export class AccountManager {
         // account can serve the executor but not the advisor model, staying
         // put loses one advisor sub-call while moving would go cache-cold on
         // the session's entire context — stay put.
-        if (!excluded && advisorModel && this._isAvailable(acct, model)) {
+        if (!excluded && !heldBack && advisorModel && this._isAvailable(acct, model) && !this.isOverHardCap(acct, advisorModel)) {
           bound.lastSeen = Date.now();
           return acct;
         }
@@ -410,10 +535,10 @@ export class AccountManager {
         // the binding stays; only this request is served elsewhere. The detour
         // target is deterministic (same selection key), so repeated detours
         // land on the same account and warm it as a de-facto secondary.
-        if (excluded || this._isAvailable(acct)) {
+        if (!heldBack && (excluded || this._isAvailable(acct))) {
           bound.lastSeen = Date.now();
           const detour = this._pickForNewSession(exclude, model, advisorModel)
-            || (advisorModel ? this._pickForNewSession(exclude, model, null) : null);
+            || (advisorModel ? this._pickForNewSession(this._withAdvisorCapExcluded(exclude, advisorModel), model, null) : null);
           if (detour) return detour;
           return this.getActiveAccount(exclude, model, advisorModel);
         }
@@ -424,7 +549,7 @@ export class AccountManager {
     let pick = this._pickForNewSession(exclude, model, advisorModel);
     // Advisor degrade for placement too: never fail a session's placement over
     // the advisor model when some account can serve the executor.
-    if (!pick && advisorModel) pick = this._pickForNewSession(exclude, model, null);
+    if (!pick && advisorModel) pick = this._pickForNewSession(this._withAdvisorCapExcluded(exclude, advisorModel), model, null);
     if (!pick) {
       // Nothing eligible — run the legacy walk for its exhausted-fleet probe /
       // synthetic-429 handling. Deliberately not bound: the next request
@@ -437,7 +562,8 @@ export class AccountManager {
       // already running) so admit() paces the burst like a legacy switch
       // would (issue #84).
       if (this.ramp.enabled && pick.rampStartedAt == null) this._beginRamp(pick);
-      console.log(`[TeamClaude] Session ${sessionId.slice(0, 8)} rebound "${this.accounts[bound.index]?.name ?? '?'}" → "${pick.name}" (account unavailable — this session's prompt cache starts cold)`);
+      const why = heldBack ? 'own account available again, leaving fallback-only' : 'account unavailable';
+      console.log(`[TeamClaude] Session ${sessionId.slice(0, 8)} rebound "${this.accounts[bound.index]?.name ?? '?'}" → "${pick.name}" (${why} — this session's prompt cache starts cold)`);
     } else if (!bound) {
       console.log(`[TeamClaude] Session ${sessionId.slice(0, 8)} → "${pick.name}" (${this._sessionCount(pick.index) + 1} bound, priority ${pick.priority || 0})`);
     }
@@ -486,6 +612,7 @@ export class AccountManager {
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (!this._isAvailable(account, model, advisorModel)) continue;
+      if (this._fallbackHeld(account, model, advisorModel, exclude)) continue;
       const load = this._sessionCount(account.index);
       const over = load >= this.affinity.maxPerAccount;
       const paused = account.pausedUntil && account.pausedUntil > now ? 1 : 0;
@@ -635,7 +762,17 @@ export class AccountManager {
         console.log(`[TeamClaude] No account eligible for advisor model "${advisorModel}" — routing by request model only`);
       }
     }
-    return this._select(exclude, model, null, true);
+    return this._select(this._withAdvisorCapExcluded(exclude, advisorModel), model, null, true);
+  }
+
+  /** `exclude` plus every account over its hard cap for `advisorModel`. The
+   *  advisor-degrade fallbacks route by the executor model alone, but the
+   *  advisor sub-call still spends the chosen account's family bucket. */
+  _withAdvisorCapExcluded(exclude, advisorModel) {
+    if (!advisorModel) return exclude;
+    const capped = this.accounts.filter(a => this.isOverHardCap(a, advisorModel));
+    if (!capped.length) return exclude;
+    return new Set([...(exclude || []), ...capped.map(a => a.index)]);
   }
 
   /** The selection walk getActiveAccount runs: manual pin → current account →
@@ -665,7 +802,10 @@ export class AccountManager {
       const next = this._selectNext(exclude, model, advisorModel);
       if (next) { current.requalify = false; return next; }
     }
-    if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)) {
+    // A fallback-only current account is preempted outright while an own
+    // account can serve (see _fallbackHeld) — whatever their priorities say.
+    if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)
+        && !this._fallbackHeld(current, model, advisorModel, exclude)) {
       // Priority preemption via upstream's shared predicate, so _select and
       // eligibility() can never drift apart on the answer.
       const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
@@ -709,11 +849,13 @@ export class AccountManager {
     const pinIdx = this.sessionTracker.pinnedAccount(sessionId);
     if (pinIdx != null) {
       const pinned = this.accounts[pinIdx];
-      if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
+      if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)
+          && !this._fallbackHeld(pinned, model, advisorModel, exclude)) {
         // Mirror _select's priority preemption so an operator's priority order
         // still wins over a session's stickiness.
         const betterExists = this.accounts.some(a =>
-          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0)
+          && !this._fallbackHeld(a, model, advisorModel, exclude));
         if (!betterExists) return pinned;
       }
     }
@@ -734,6 +876,7 @@ export class AccountManager {
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (!this._isAvailable(account, model, advisorModel)) continue;
+      if (this._fallbackHeld(account, model, advisorModel, exclude)) continue;
       const priority = account.priority || 0;
       const sessions = this.sessionTracker.activeCountFor(account.index, now);
       const inFlight = account.inFlight || 0;
@@ -804,11 +947,12 @@ export class AccountManager {
     const pinned = this._pinnedAccountForModel(model);
     if (pinned && this._isAvailable(pinned, model)) return pinned.index;
     const current = this.accounts[this.currentIndex];
-    if (current && this._isAvailable(current, model)) {
+    if (current && this._isAvailable(current, model) && !this._fallbackHeld(current, model)) {
       // Mirror getActiveAccount's priority preemption: a strictly higher-priority
       // available account wins over a healthy current one; same tier stays put.
       const better = this.accounts.some(a =>
-        this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
+        this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0)
+        && !this._fallbackHeld(a, model));
       if (!better) return current.index;
     }
     const best = this._pickBestAvailable(null, model);
@@ -821,6 +965,8 @@ export class AccountManager {
     // whose token is broken — those are hard states, not stale guesses.
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted') return false;
+    // A probe is a live request: it spends quota like any other.
+    if (this.isOverHardCap(account)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -910,6 +1056,7 @@ export class AccountManager {
     const now = Date.now();
     let best = null;
     let bestUsage = Infinity;
+    let bestFallback = true;
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (account.disabled) continue;
@@ -923,11 +1070,18 @@ export class AccountManager {
       if (account.status === 'exhausted' || account.status === 'error') continue;
       if (model && !this._routeAllows(account, model)) continue;
       if (advisorModel && !this._routeAllows(account, advisorModel)) continue;
+      // The band above switchThreshold is this path's whole purpose — but never
+      // past an operator hard cap, which is absolute.
+      if (this.isOverHardCap(account, model)) continue;
+      if (advisorModel && this.isOverHardCap(account, advisorModel)) continue;
       // Only a bucket the provider reports as genuinely full is out; anything
       // below 1.0 still has something left to give.
       const usage = this._maxUtilization(account, model);
       if (usage >= 1) continue;
-      if (usage < bestUsage) { bestUsage = usage; best = account; }
+      // Own accounts' last band is drained before any fallback-only account is
+      // touched, however much headroom the fallback one has.
+      const fb = !!account.fallbackOnly;
+      if (!best || (fb !== bestFallback ? !fb : usage < bestUsage)) { bestUsage = usage; best = account; bestFallback = fb; }
     }
     if (best) {
       console.log(`[TeamClaude] Last resort: every account is over the ${Math.round(this.switchThreshold * 100)}% switch threshold — draining "${best.name}" at ${Math.round(bestUsage * 100)}% rather than refusing locally`);
@@ -948,8 +1102,7 @@ export class AccountManager {
     if (now < this._nextProbeAt) return null;
 
     let best = null;
-    let bestPriority = Infinity;
-    let bestUsage = Infinity;
+    let bestKey = null;
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (!this._isProbeable(account)) continue;
@@ -960,14 +1113,12 @@ export class AccountManager {
       // Same for routing/ownership: a probe for a routed or owned model must not
       // land on an ineligible account (it would just reject the unknown model id).
       if (model && !this._routeAllows(account, model)) continue;
-      const priority = account.priority || 0;
-      const usage = this._maxUtilization(account, model);
-      if (priority < bestPriority ||
-          (priority === bestPriority && usage < bestUsage)) {
-        bestPriority = priority;
-        bestUsage = usage;
-        best = account;
-      }
+      // _isProbeable checked the shared buckets; this adds the model's family one.
+      if (model && this.isOverHardCap(account, model)) continue;
+      // Own accounts are revalidated before any fallback-only one: their stale
+      // quota is what should return the fleet to service.
+      const key = [account.fallbackOnly ? 1 : 0, account.priority || 0, this._maxUtilization(account, model)];
+      if (!best || keyLess(key, bestKey)) { best = account; bestKey = key; }
     }
     if (!best) return null;
 
@@ -1016,6 +1167,8 @@ export class AccountManager {
     if (advisorModel) {
       if (this._modelWeeklyExhausted(account, advisorModel)) return false;
       if (!this._routeAllows(account, advisorModel)) return false;
+      // The advisor's family bucket spends this account's quota too.
+      if (this.isOverHardCap(account, advisorModel)) return false;
     }
 
     return true;
@@ -1031,7 +1184,9 @@ export class AccountManager {
   _preemptedBy(account, model = null, advisorModel = null, exclude = null) {
     return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
       && !exclude?.has(a.index)
-      && (a.priority || 0) < (account.priority || 0)) || null;
+      && (a.priority || 0) < (account.priority || 0)
+      // A held-back fallback-only account outranks nobody, whatever its priority.
+      && !this._fallbackHeld(a, model, advisorModel, exclude)) || null;
   }
 
   /**
@@ -1062,6 +1217,9 @@ export class AccountManager {
     const preemptor = this._preemptedBy(account);
     if (preemptor) {
       return { eligible: false, reason: `outranked by higher-priority account "${preemptor.name}"` };
+    }
+    if (this._fallbackHeld(account)) {
+      return { eligible: false, reason: 'fallback-only and held back while own accounts are available' };
     }
     return { eligible: true };
   }
@@ -1336,6 +1494,7 @@ export class AccountManager {
     for (const acc of candidates) {
       if (acc.index === this.currentIndex) continue;
       if (!this._isAvailable(acc)) continue; // enough session & weekly quota left
+      if (this._fallbackHeld(acc)) continue;
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
       const weekly = acc.quota.unified7dReset;
@@ -1353,9 +1512,59 @@ export class AccountManager {
     }
   }
 
+  /**
+   * Whether `account` has reached its operator-set hard ceiling
+   * (`maxUtilization`). switchThreshold is a soft line that last-resort draining
+   * and revalidation probes deliberately cross; this one is absolute, so every
+   * path that can put a request on an account checks it: normal selection (via
+   * _isNearQuota), last resort, probes, explicit pins and keep-warm.
+   * The weekly cap covers the shared weekly bucket AND the family bucket that
+   * governs `model` — "85% of her weekly" must hold whichever one is metered.
+   * It is enforced before each request from the latest known utilization, so a
+   * request already in flight can still carry a bucket slightly past the cap.
+   *
+   * A trip is LATCHED until the reset of the bucket that tripped: inside one
+   * window utilization only rises, so a later lower reading (an out-of-order
+   * header under concurrency, a lagging prober read — both seen live on this
+   * account) is stale and must not reopen the account.
+   */
+  isOverHardCap(account, model = null) {
+    const cap = account?.maxUtilization;
+    if (!cap) return false;
+    if (cap.invalid) return true;
+    this._clearExpiredQuotas(account);
+    const q = account.quota;
+    const now = Date.now();
+    if (account.capLatch && now >= account.capLatch.until) account.capLatch = null;
+    const over5h = cap.fiveHour != null && q.unified5h != null && q.unified5h >= cap.fiveHour;
+    const overWk = cap.weekly != null && q.unified7d != null && q.unified7d >= cap.weekly;
+    if (over5h || overWk) {
+      const until = Math.max(
+        over5h ? (q.unified5hReset || now + 5 * 3600_000) : 0,
+        overWk ? (q.unified7dReset || now + 7 * 86400_000) : 0);
+      if (!account.capLatch || until > account.capLatch.until) account.capLatch = { until };
+    }
+    const shared = !!account.capLatch;
+    // Logged on the model-independent state only, so a family bucket checked
+    // for one request and not the next cannot make the log flap.
+    if (shared !== !!account.overHardCap) {
+      account.overHardCap = shared;
+      console.log(shared
+        ? `[TeamClaude] "${account.name}" reached its usage cap (5h ${pct(q.unified5h)}, weekly ${pct(q.unified7d)}; caps 5h ${pct(cap.fiveHour)}, weekly ${pct(cap.weekly)}) — no requests until ${new Date(account.capLatch.until).toISOString()}`
+        : `[TeamClaude] "${account.name}" is back under its usage cap — available again`);
+    }
+    if (shared) return true;
+    if (cap.weekly == null) return false;
+    const governing = this._governingWeekly(account, model);
+    return governing != null && governing >= cap.weekly;
+  }
+
   _isNearQuota(account, model = null) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
+
+    // Operator hard cap first: it can sit below switchThreshold.
+    if (this.isOverHardCap(account, model)) return true;
 
     // Shared 5-hour bucket gates every request regardless of model.
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
@@ -1406,6 +1615,7 @@ export class AccountManager {
       // soonest-expiring pick only ever lands on an account whose 5-hour quota
       // is still below 98%.
       if (!this._isAvailable(account, model, advisorModel)) continue;
+      if (this._fallbackHeld(account, model, advisorModel, exclude)) continue;
 
       // Fable-reserve first (see _reservesFable): for a non-Fable request, an
       // account that still has Fable headroom sorts AFTER every Fable-spent one,
@@ -1465,6 +1675,8 @@ export class AccountManager {
     // All accounts unavailable — find the one that resets soonest
     let soonestAccount = null;
     let soonestTime = Infinity;
+    let soonestKey = null;
+    const nowMs = Date.now();
 
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
@@ -1477,12 +1689,19 @@ export class AccountManager {
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
       if (advisorModel && !this._routeAllows(account, advisorModel)) continue;
+      // A "reset" here only means some window rolled over — not the capped one.
+      if (this.isOverHardCap(account, model) || (advisorModel && this.isOverHardCap(account, advisorModel))) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
         || (account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null);
 
-      if (resetTime && resetTime < soonestTime) {
+      if (!resetTime) continue;
+      // Only a DUE reset is ever taken below, and among due ones an own account
+      // wins over a fallback-only one; otherwise the soonest reset (unchanged).
+      const key = [resetTime <= nowMs ? 0 : 1, account.fallbackOnly ? 1 : 0, resetTime];
+      if (!soonestKey || keyLess(key, soonestKey)) {
+        soonestKey = key;
         soonestTime = resetTime;
         soonestAccount = account;
       }
@@ -1566,6 +1785,59 @@ export class AccountManager {
           : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }
+  }
+
+  /**
+   * Mirror an API key account's monthly spend into its weekly bucket, so the
+   * usual selection and maxUtilization cap treat "spent / budget" like any
+   * other utilization. No-op for accounts without a monthlyBudget.
+   */
+  _applySpend(account) {
+    if (!account?.monthlyBudget) { if (account) account.apiSpend = null; return; }
+    const e = this.spendLedger.get(account.name);
+    const util = e.exhaustedAt ? 1 : e.usd / account.monthlyBudget;
+    account.quota.unified7d = util;
+    account.quota.unified7dReset = nextMonthStart();
+    account.probing = false;
+    account.apiSpend = {
+      month: e.month, usd: e.usd, budget: account.monthlyBudget,
+      requests: e.requests, exhaustedAt: e.exhaustedAt || null,
+    };
+  }
+
+  /** Price one completed exchange on a budgeted API key account. */
+  recordSpend(accountIndex, model, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account?.monthlyBudget || !usage) return;
+    const usd = costOf(model, usage);
+    if (usd > 0) this.spendLedger.add(account.name, usd);
+    this._applySpend(account);
+  }
+
+  /** Upstream refused for lack of credit: out until the month rolls over. */
+  markCreditExhausted(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    if (account.monthlyBudget) {
+      this.spendLedger.markExhausted(account.name);
+      this._applySpend(account);
+    } else {
+      account.quota.unified7d = 1;
+      account.quota.unified7dReset = nextMonthStart();
+    }
+    console.error(`[TeamClaude] "${account.name}" has no API credit left — skipped until ${new Date(nextMonthStart()).toISOString().slice(0, 10)}`);
+  }
+
+  /** Re-read the budget after a config reload. */
+  setMonthlyBudget(accountIndex, acct) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    const budget = budgetOf(acct);
+    if (budget === account.monthlyBudget) return;
+    account.monthlyBudget = budget;
+    if (!budget) { account.quota.unified7d = null; account.quota.unified7dReset = null; }
+    this._applySpend(account);
+    console.log(`[TeamClaude] Monthly API budget for "${account.name}": ${budget ? '$' + budget : 'removed'}`);
   }
 
   /**
@@ -1793,6 +2065,7 @@ export class AccountManager {
   addAccount(acctData) {
     const index = this.accounts.length;
     this.accounts.push(makeAccount(acctData, index));
+    this._applySpend(this.accounts[index]);
     this._sessionCounts.push(0);
     return index;
   }
@@ -1885,6 +2158,9 @@ export class AccountManager {
         orgName: a.orgName || null,
         priority: a.priority || 0,
         disabled: a.disabled || false,
+        maxUtilization: a.maxUtilization || null,
+        fallbackOnly: !!a.fallbackOnly,
+        overHardCap: a.maxUtilization ? this.isOverHardCap(a) : false,
         status: a.status,
         // NOTE: `sessions` above is OURS (affinity bindings, drives placement and
         // tcq's `ses` column). Upstream also emitted `sessions:
@@ -1893,6 +2169,7 @@ export class AccountManager {
         // per-account numbers remain available under `sessions.perAccount`.
         quota: { ...a.quota },
         usage: { ...a.usage },
+        apiSpend: a.apiSpend ? { ...a.apiSpend } : null,
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
           : null,

@@ -97,6 +97,11 @@ export class Warmer {
     if (account.upstream) return false;
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
+    // The pin path would refuse it anyway; skip instead of spawning a doomed claude.
+    if (this.am.isOverHardCap?.(account)) return false;
+    // A fallback-only (lent) account takes no traffic of ours until the own
+    // fleet is spent — and opening its 5h window early is traffic.
+    if (account.fallbackOnly) return false;
     const reset = account.quota?.unified5hReset;
     return !(reset && Date.now() < reset); // a future reset ⇒ session already running
   }

@@ -1,3 +1,4 @@
+import { isCreditExhausted } from './api-spend.js';
 import http from 'node:http';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
@@ -31,6 +32,26 @@ export const HOP_BY_HOP_HEADERS = new Set([
 // Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
 const PIN_PREFIX = '/tc-acct/';
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
+// A "rejected" unified status counts as genuine quota exhaustion once the
+// account's own utilization reaches this bar (or switchThreshold, if lower).
+// Independent of switchThreshold so that raising it to 1.0 (drain every own
+// account to the end) cannot turn a real rejection reported at 99.x% into an
+// endless pause-and-retry on the same account.
+const QUOTA_REJECT_MIN_UTILIZATION = 0.98;
+
+// Before a hold / inline-wait re-entry: accounts tried earlier in this request
+// that are usable again (hold expired, window reset) may serve the retry. Left
+// in ctx.tried they would stay excluded for the whole hold, and a fallback-only
+// account would take the retry while a recovered own account sits idle.
+// Credential-refused (403) and model-refused (400 after modelMap) accounts stay
+// excluded: waiting does not fix either.
+export function forgetRecovered(ctx, accountManager) {
+  for (const idx of [...ctx.tried]) {
+    const acct = accountManager.accounts[idx];
+    if (!acct || ctx.credentialRejected?.has(acct.name) || ctx.modelRefused?.has(idx)) continue;
+    if (accountManager.isUsable(acct, ctx.model)) ctx.tried.delete(idx);
+  }
+}
 // How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
 // on the SAME account) before surfacing a 429 + retry-after to the client. A
 // rate-limit 429 never rotates accounts (that just moves the burst); it pauses
@@ -811,6 +832,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
     : accountManager.getAccountForSession(ctx.sessionId, ctx.tried, ctx.model, ctx.advisorModel);
+  // A pin bypasses selection — and with it every quota check — so an operator
+  // hard cap (maxUtilization) has to be enforced here as well; the keep-warm
+  // scheduler reaches accounts through this same pin path.
+  if (account && ctx.pinnedIndex != null && (accountManager.isOverHardCap(account, ctx.model)
+      || (ctx.advisorModel && accountManager.isOverHardCap(account, ctx.advisorModel)))) {
+    ctx.status = 429;
+    ctx.account = `(${account.name} at usage cap)`;
+    if (!res.headersSent) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '300' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'rate_limit_error', message: `Pinned account "${account.name}" has reached its configured usage cap (maxUtilization); it takes no requests until its usage drops.` },
+      }));
+    }
+    return;
+  }
   if (!account) {
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
@@ -872,6 +909,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
       if (res.destroyed) return;
+      forgetRecovered(ctx, accountManager);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -881,6 +919,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       if (res.destroyed) return;
+      forgetRecovered(ctx, accountManager);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -924,6 +963,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Build upstream request headers
   const isOAuth = account.type === 'oauth';
+  const isApiKeyAnthropic = account.type === 'apikey' && !isOpenAI && !account.upstream;
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -938,6 +978,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // An OpenAI backend has no idea what anthropic-version / anthropic-beta
     // mean; some reject the whole request over an unknown header.
     if (isOpenAI && lk.startsWith('anthropic-')) continue;
+    // An Anthropic API key account authenticates with x-api-key alone. The
+    // client's own Authorization (in MITM mode: the OAuth token of whatever
+    // account Claude Code is logged into) must not ride along, and neither may
+    // the OAuth beta flag that only makes sense with it.
+    if (isApiKeyAnthropic && lk === 'authorization') continue;
+    if (isApiKeyAnthropic && lk === 'anthropic-beta') {
+      const kept = String(value).split(',').map(v => v.trim()).filter(v => v && !/^oauth-/.test(v));
+      if (kept.length) headers[key] = kept.join(',');
+      continue;
+    }
     headers[key] = value;
   }
 
@@ -1037,6 +1087,30 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // client that disconnects while waiting just drops out.
     if (!await accountManager.admit(account.index, () => res.destroyed)) return;
     dbg?.(`admitted inFlight=${account.inFlight}`);
+    // The hard cap was checked at selection, but a request can wait in admit()
+    // (a 429 pause, the post-rebind ramp) while other responses push the account
+    // over it. Check again at the last moment before anything goes upstream;
+    // re-selection then skips the account (a pin gets the cap 429).
+    if (accountManager.isOverHardCap(account, ctx.model)
+        || (ctx.advisorModel && accountManager.isOverHardCap(account, ctx.advisorModel))) {
+      accountManager.release(account.index);
+      if (res.destroyed) return;
+      if (ctx.pinnedIndex == null) ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
+    // Same last-moment check for a fallback-only account: while this request
+    // waited in admit() (its pause, the post-rebind ramp) an own account may
+    // have become usable again. Give the slot back and re-select WITHOUT
+    // excluding the fallback account — re-selection moves to the own account.
+    // Bounded so a selection that keeps returning it can never loop.
+    if (ctx.pinnedIndex == null && (ctx.fallbackRequeues || 0) < 2
+        && accountManager.shouldLeaveFallback(account, ctx.model, ctx.advisorModel, ctx.tried)) {
+      accountManager.release(account.index);
+      if (res.destroyed) return;
+      ctx.fallbackRequeues = (ctx.fallbackRequeues || 0) + 1;
+      console.log(`[TeamClaude] "${account.name}" is fallback-only and an own account is usable again — re-selecting`);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
     let upstreamRes;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -1095,7 +1169,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // threshold falls through to the transient rate-limit path (pause + retry
       // the same account), keeping it selectable instead of benching it for an
       // hour. Genuine exhaustion (utilization >= threshold) still throttles.
-      const thr = accountManager.switchThreshold;
+      const thr = Math.min(accountManager.switchThreshold, QUOTA_REJECT_MIN_UTILIZATION);
       const rejected5 = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected';
       const rejected7 = rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
       const u5 = account.quota.unified5h ?? 0;
@@ -1205,6 +1279,26 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
+    // A pay-as-you-go API key account that ran out of credit: take it out until
+    // the month rolls over and fail over, instead of handing the client a 400
+    // it would treat as a broken request.
+    if (isApiKeyAnthropic && (upstreamRes.status === 402 || upstreamRes.status === 400)
+        && !res.headersSent && retryCount < maxRetries) {
+      // Error bodies are small: buffer it, and if it is not the credit message
+      // put the same bytes back so the normal path relays it untouched (the
+      // upstream response has no clone()).
+      let buf = Buffer.alloc(0);
+      try { buf = Buffer.from(await upstreamRes.arrayBuffer()); } catch { /* relay what we have */ }
+      if (!isCreditExhausted(upstreamRes.status, buf.toString('utf8'))) {
+        upstreamRes = rebuffered(upstreamRes, buf);
+      } else {
+        accountManager.markCreditExhausted(account.index);
+        ctx.tried.add(account.index);
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
         && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
       ctx.reauthed.add(account.index);
@@ -1212,6 +1306,37 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
       await accountManager.ensureTokenFresh(account.index, true);
       if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
+    // A 400 from upstream usually means the request itself is malformed (bad
+    // model id, field mismatch) — but it can also mean THIS account can't serve
+    // the model. Unlike 403 (credential) and 429 (quota), a 400 does NOT prove
+    // the account is unusable for OTHER models, so rotating on every 400 would
+    // burn the fleet. But if the model was explicitly rewritten by this
+    // account's modelMap (proxy mapped it for this backend), a 400 means the
+    // upstream genuinely can't handle the rewritten request — skip this account
+    // and try the next, so e.g. claude-fable-5-1 (mapped to k3 on Kimi) falls
+    // through to a backend that can serve it instead of looping 400 on OAuth.
+    if (upstreamRes.status === 400 && account.modelMap && ctx.model && account.modelMap[ctx.model] && retryCount < maxRetries) {
+      await upstreamRes.body?.cancel();
+      ctx.tried.add(account.index);
+      (ctx.modelRefused ??= new Set()).add(account.index);
+      console.log(`[TeamClaude] 400 on "${account.name}" for rewritten model "${ctx.model}" → "${account.modelMap[ctx.model]}" — skipping account, trying next`);
+      if (res.destroyed) return;
+      // If every account has been tried (and failed), don't loop forever —
+      // surface the 400 to the client instead of spinning.
+      if (ctx.tried.size >= accountManager.accounts.length) {
+        ctx.status = 400;
+        if (!res.headersSent) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: `All accounts rejected the request (last 400 from "${account.name}").` },
+          }));
+        }
+        return;
+      }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1298,13 +1423,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const l = getLog();
     if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
-    const isTransient = err instanceof Error &&
-      (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT' ||
-        err.name === 'TimeoutError' || err.name === 'AbortError' ||
-        err.message.includes('fetch failed') ||
-        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
+    const isTransient = isTransientUpstreamError(err);
 
     // Feed the provider-outage breaker. isLocalFault() filters out DNS/connect
     // failures, and the breaker itself refuses to arm without a recent success
@@ -1373,6 +1492,31 @@ function resolveBodyIdleTimeout() {
 // read result, or rejects with a transient TEAMCLAUDE_BODY_TIMEOUT if no chunk
 // arrives within `ms`. The pending read is abandoned on timeout; the caller
 // cancels the reader (evicting the socket) in its finally block.
+// Network-level failures of the upstream connection. These say nothing about the
+// account, so the proxy drops the client connection and lets Claude Code retry
+// instead of failing over. Failing over is wrong for them: with one usable
+// account left, the failover ran out of accounts and answered "All N accounts
+// exhausted. Retry in 3000s" on every network blip (seen 29.10 on a flaky link:
+// write EPIPE, "aborted", "socket hang up", TLS "bad record mac").
+const TRANSIENT_CODES = new Set([
+  'TEAMCLAUDE_HEADERS_TIMEOUT', 'TEAMCLAUDE_BODY_TIMEOUT',
+  'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE',
+  'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN', 'EAI_AGAIN',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+]);
+const TRANSIENT_MESSAGE = /fetch failed|^aborted$|socket hang up|other side closed|bad record mac|decryption failed|wrong version number/i;
+
+export function isTransientUpstreamError(err) {
+  if (!(err instanceof Error)) return false;
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
+  for (let e = err, depth = 0; e && depth < 3; e = e.cause, depth++) {
+    if (TRANSIENT_CODES.has(e.code)) return true;
+    if (typeof e.code === 'string' && e.code.startsWith('ERR_SSL_')) return true;
+    if (typeof e.message === 'string' && TRANSIENT_MESSAGE.test(e.message)) return true;
+  }
+  return false;
+}
+
 export function readWithIdleTimeout(reader, ms) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -1399,6 +1543,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   const decoder = new TextDecoder();
   let sseBuffer = '';
   let errored = false;
+  const usageState = {};
 
   try {
     while (true) {
@@ -1424,7 +1569,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager, usageState);
         // Rewriting needs whole events, so with fq on we relay per complete
         // event instead of per chunk: an incomplete trailing event waits in
         // sseBuffer (flushed below) rather than going out unrewritten.
@@ -1452,7 +1597,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, usageState);
     }
     // With rewriting on, a trailing partial event was never relayed — flush it
     // verbatim so the stream still ends with every byte the upstream sent.
@@ -1500,7 +1645,20 @@ function journalExchange(accountManager, accountIndex, usage, model) {
   journalResponse({ account: account.name, model, usage, quota: account.quota, status: 200 });
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+// A copy of an upstream response whose body was already read into `buf`.
+function rebuffered(res, buf) {
+  return {
+    status: res.status,
+    ok: res.ok,
+    headers: res.headers,
+    body: new ReadableStream({ start(c) { if (buf.length) c.enqueue(new Uint8Array(buf)); c.close(); } }),
+    async json() { return JSON.parse(buf.toString('utf8')); },
+    async text() { return buf.toString('utf8'); },
+    async arrayBuffer() { return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength); },
+  };
+}
+
+function parseSSEUsage(event, accountIndex, accountManager, state = {}) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -1513,9 +1671,16 @@ function parseSSEUsage(event, accountIndex, accountManager) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0,
         data.message.usage, data.message.model || null);
       if (journalEnabled()) pendingSseUsage.set(accountIndex, { ...data.message.usage });
+      // Per-stream copy for spend pricing: pendingSseUsage is keyed by account
+      // and concurrent streams on one account would overwrite each other.
+      state.opening = { ...data.message.usage };
+      state.model = data.message.model || null;
     } else if (data.type === 'message_delta' && data.usage) {
       const model = sseModel(accountManager, accountIndex);
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens, data.usage, model);
+      // message_delta's usage is cumulative, so it overrides the opening half.
+      accountManager.recordSpend?.(accountIndex, state.model || model, { ...(state.opening || {}), ...data.usage });
+      state.opening = null;
       if (journalEnabled()) {
         const opening = pendingSseUsage.get(accountIndex) || {};
         pendingSseUsage.delete(accountIndex);
@@ -1546,6 +1711,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens,
         json.usage, json.model || null);
+      accountManager.recordSpend?.(accountIndex, json.model || null, json.usage);
       journalExchange(accountManager, accountIndex, json.usage, json.model || null);
     }
   } catch {

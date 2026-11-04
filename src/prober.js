@@ -8,12 +8,24 @@
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
+import { fetchKimiUsage } from './kimi-quota.js';
+
+/** Which probe an account supports, or null when it can't be probed.
+ *  'oauth' — the zero-spend Anthropic usage endpoint (the original path).
+ *  'kimi'  — Kimi exposes no ratelimit headers at all, so its quota is only
+ *            readable from the web console gateway (see kimi-quota.js). */
+function probeKindOf(account) {
+  if (account.quotaProvider === 'kimi') return account.webToken ? 'kimi' : null;
+  if (account.type === 'oauth' && account.credential) return 'oauth';
+  return null;
+}
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, timeoutMs = 10_000, log = console.log } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, kimiProbeFn = fetchKimiUsage, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
     this.intervalMs = intervalMs;
     this.probeFn = probeFn;
+    this.kimiProbeFn = kimiProbeFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
     this.timer = null;
@@ -60,7 +72,7 @@ export class Prober {
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
-      const accounts = this.am.accounts.filter(account => account.type === 'oauth' && account.credential);
+      const accounts = this.am.accounts.filter(account => probeKindOf(account) !== null);
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -72,12 +84,19 @@ export class Prober {
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
     try {
-      await this.am.ensureTokenFresh(account.index);
-      let usage = await this._withTimeout(this.probeFn(account.credential));
-      if (usage?.status === 401) {
-        // Token rejected: force refresh and retry once.
-        await this.am.ensureTokenFresh(account.index, true);
+      let usage;
+      if (probeKindOf(account) === 'kimi') {
+        // No OAuth token to refresh here — the web token is supplied verbatim and
+        // expires on its own (reported as an error, not silently stale quota).
+        usage = await this._withTimeout(this.kimiProbeFn(account.webToken));
+      } else {
+        await this.am.ensureTokenFresh(account.index);
         usage = await this._withTimeout(this.probeFn(account.credential));
+        if (usage?.status === 401) {
+          // Token rejected: force refresh and retry once.
+          await this.am.ensureTokenFresh(account.index, true);
+          usage = await this._withTimeout(this.probeFn(account.credential));
+        }
       }
 
       if (!usage || usage.error) {
@@ -125,7 +144,7 @@ export class Prober {
         const status = this.accountStatus.get(account.name);
         return {
           name: account.name,
-          status: account.type === 'oauth' ? (status?.status || 'never') : 'not-applicable',
+          status: probeKindOf(account) !== null ? (status?.status || 'never') : 'not-applicable',
           lastProbedAt: iso(status?.finishedAt),
           startedAt: iso(status?.startedAt),
           durationMs: status?.durationMs ?? null,

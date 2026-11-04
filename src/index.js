@@ -7,6 +7,7 @@ import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
+import { applyAccountPolicy } from './disk-policy.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts, findUpsertTarget } from './identity.js';
@@ -1734,6 +1735,11 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    // Hard usage cap and fallback-only flag: adding, changing and removing (a
+    // missing key) all apply on reload; the in-memory config entry is mirrored
+    // so a later TUI save does not write the old values back.
+    const memAcct = memConfig.accounts[mgrIdx];
+    applyAccountPolicy(accountManager, mgrIdx, diskAcct, memAcct && sameIdentity(memAcct, diskAcct) ? memAcct : null);
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
